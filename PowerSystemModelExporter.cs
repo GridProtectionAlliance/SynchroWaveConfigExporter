@@ -935,7 +935,7 @@ public static class PowerSystemModelExporter
     // ========= Line derivation =========
 
     /// <summary>
-    /// Derives transmission lines from line-terminal (_P_) PMU devices. Parses the
+    /// Derives transmission lines from line-terminal (_P_/_Q_) PMU devices. Parses the
     /// device Name "STATION-REMOTE {KV}KV" to identify from/to station connections,
     /// matches them to buses, and looks up terminal measurement points from the
     /// existing signal mappings.

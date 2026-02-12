@@ -346,8 +346,8 @@ public static class SttpConfigExporter
     /// <summary>
     /// Gets a unique key identifying the phasor/line group for a measurement.
     /// Measurements with the same line group key should share the same MeasurementPoint.
-    /// PMU devices (identified by _P_ pattern) group all measurements together.
-    /// Phasor measurements group by Device + PhasorLabel (with phase suffix stripped).
+    /// PMU devices group all measurements together. Phasor measurements group by
+    /// Device + PhasorLabel (with phase suffix stripped).
     /// Calculated values group by Device + extracted line name.
     /// Frequency/dF/dt measurements get special handling to find associated phasors.
     /// </summary>

@@ -65,13 +65,13 @@ public static class DeviceHelper
 
     /// <summary>
     /// Checks if a device is a PMU (line-terminal) device based on naming convention.
-    /// PMU devices have _P_ followed by 3 letters and 1 digit (e.g.: _P_NNN4, _P_ENN8).
+    /// PMU devices have _P_ or _Q_ followed by 3 letters and 1 digit (e.g.: _P_NNN4, _Q_ENN8).
     /// </summary>
     /// <param name="device">The device acronym to check.</param>
     /// <returns><c>true</c> if the device matches the PMU naming pattern; otherwise, <c>false</c>.</returns>
     /// <remarks>
     /// This method uses Entergy-specific naming conventions where PMU devices are identified
-    /// by the pattern "_P_" followed by exactly 3 letters and 1 digit.
+    /// by the pattern "_P_" or _Q_ followed by exactly 3 letters and 1 digit.
     /// </remarks>
     public static bool IsPMUDevice(string? device)
     {
@@ -81,14 +81,18 @@ public static class DeviceHelper
         // Look for _P_ pattern followed by exactly 3 letters and 1 digit
         int index = device.IndexOf("_P_", StringComparison.OrdinalIgnoreCase);
 
+        // Look for _Q_ pattern if _P_ not found (some solar/inverter devices use _Q_ instead of _P_)
+        if (index < 0)
+            index = device.IndexOf("_Q_", StringComparison.OrdinalIgnoreCase);
+
         if (index < 0)
             return false;
 
-        // Check what follows _P_
-        int suffixStart = index + 3; // Position after "_P_"
+        // Check what follows _P_ or _Q_
+        int suffixStart = index + 3; // Position after "_P_" or "_Q_"
 
         if (suffixStart + 4 != device.Length)
-            return false; // Must be exactly 4 characters after _P_
+            return false; // Must be exactly 4 characters after _P_ or _Q_
 
         string suffix = device[suffixStart..];
 
@@ -170,6 +174,9 @@ public static class DeviceHelper
             return null;
 
         int index = device.IndexOf("_P_", StringComparison.OrdinalIgnoreCase);
+
+        if (index < 0)
+            index = device.IndexOf("_Q_", StringComparison.OrdinalIgnoreCase); // Some solar/inverter devices use _Q_ instead of _P_
 
         return index <= 0 ? null : device[..index];
     }
