@@ -1,12 +1,12 @@
-﻿# GPA Time-Series to SEL SynchroWave Configuration Exporter
+﻿# GPA to SEL SynchroWave Operations Configuration Exporter
 
-A .NET console application that exports synchrophasor data configurations from Grid Protection Alliance (GPA) time-series applications (such as openHistorian, openPDC, or SIEGate) to formats compatible with SEL SynchroWave visualization system applications.
+A .NET console application that exports synchrophasor data configurations from Grid Protection Alliance (GPA) time-series applications (such as openHistorian, openPDC, or SIEGate) to formats compatible with SEL SynchroWave Operations visualization system applications.
 
 ## Overview
 
-The SynchroWave STTP Configuration Exporter generates multiple CSV export files for use with SEL's SynchroWave Central visualization platform:
+The SynchroWave STTP Configuration Exporter generates multiple CSV export files for use with SEL's SynchroWave Operations visualization platform:
 
-1. **STTP Signal Mappings** - Maps synchrophasor measurements to SEL SynchroWave Central signal identifiers for the IEEE 2664 data transport standard. This allows SEL SynchroWave Central to automatically injest all available measurements without manual configuration.
+1. **STTP Signal Mappings** - Maps synchrophasor measurements to SEL SynchroWave Operations signal identifiers for the IEEE 2664 data transport standard. This allows SEL SynchroWave Operations to automatically injest all available measurements without manual configuration.
 2. **Power System Model** - Exports station, bus, and line topology information.
 3. **Dash Menu** - Creates hierarchical folder structures for organizing visualizations, e.g., by station and voltage level.
 
@@ -15,7 +15,7 @@ The exporter connects to an existing GPA application database (e.g., openHistori
 ## Features
 
 - **Automatic Database Discovery** - Reads configuration from installed GPA service registry keys
-- **STTP Signal Mapping** - Generates `MeasurementPoint` identifiers compatible with SEL SynchroWave Central using intelligent character reduction and naming convention parsing to meet the 16-character limit
+- **STTP Signal Mapping** - Generates `MeasurementPoint` identifiers compatible with SEL SynchroWave Operations using intelligent character reduction and naming convention parsing to meet the 16-character limit
 - **Power System Topology** - Extracts station locations, bus voltages, and transmission line connections
 - **Dash Menu Generation** - Creates hierarchical visualization folder structures
 - **Naming Convention Parsing** - Extracts station names, line names, and voltage levels from device-centic metadata
