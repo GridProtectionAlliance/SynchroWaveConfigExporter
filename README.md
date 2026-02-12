@@ -1,12 +1,12 @@
 ﻿# GPA to SEL SynchroWave Operations Configuration Exporter
 
-A .NET console application that exports synchrophasor data configurations from Grid Protection Alliance (GPA) time-series applications (such as openHistorian, openPDC, or SIEGate) to formats compatible with SEL SynchroWave Operations visualization system applications.
+A .NET console application that exports synchrophasor data configurations from [Grid Protection Alliance](https://gridprotectionalliance.org/) (GPA) time-series applications (such as [openHistorian](https://github.com/GridProtectionAlliance/openHistorian), [openPDC](https://github.com/GridProtectionAlliance/openPDC), or [SIEGate](https://github.com/GridProtectionAlliance/SIEGate)) to formats compatible with [SEL SynchroWave Operations](https://selinc.com/solutions/software/synchrowave-operations/) visualization system applications.
 
 ## Overview
 
 The `SynchroWaveConfigExporter` tool generates multiple CSV export files for use with SEL's SynchroWave Operations visualization platform:
 
-1. **STTP Signal Mappings** - Maps synchrophasor measurements to SEL SynchroWave Operations signal identifiers for the IEEE 2664 data transport standard. This allows SEL SynchroWave Operations to automatically ingest all available measurements without manual configuration.
+1. **STTP Signal Mappings** - Maps synchrophasor measurements to SEL SynchroWave Operations signal identifiers for the [IEEE 2664](https://standards.ieee.org/ieee/2664/7397/) data transport standard. This allows SEL SynchroWave Operations to automatically ingest all available measurements without manual configuration.
 2. **Power System Model** - Exports station, bus, and line topology information.
 3. **Dash Menu** - Creates hierarchical folder structures for organizing visualizations, e.g., by station and voltage level.
 
