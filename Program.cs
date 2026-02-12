@@ -138,8 +138,8 @@ internal class Program
     {
         LoadSettings();
 
-        Console.WriteLine("SynchroWave STTP Configuration Exporter");
-        Console.WriteLine("=======================================");
+        Console.WriteLine("SynchroWave Configuration Exporter");
+        Console.WriteLine("==================================");
         Console.WriteLine();
 
         try
