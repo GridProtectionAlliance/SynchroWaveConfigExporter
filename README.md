@@ -1,6 +1,6 @@
-﻿# GPA Time-Series to SEL SynchroWave Exporter
+﻿# GPA Time-Series to SEL SynchroWave Configuration Exporter
 
-A .NET console application that exports synchrophasor data configurations from Grid Protection Alliance (GPA) applications (such as openHistorian, openPDC, or SIEGate) to formats compatible with SEL SynchroWave visualization system.
+A .NET console application that exports synchrophasor data configurations from Grid Protection Alliance (GPA) time-series applications (such as openHistorian, openPDC, or SIEGate) to formats compatible with SEL SynchroWave visualization system applications.
 
 ## Overview
 
