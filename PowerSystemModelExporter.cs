@@ -935,6 +935,50 @@ public static class PowerSystemModelExporter
     // ========= Line derivation =========
 
     /// <summary>
+    /// Ensures line endpoint data is consistent: both MP and Bus must be on the same side when only one endpoint has data.
+    /// </summary>
+    /// <param name="fromMP">Terminal measurement point at the 'from' end.</param>
+    /// <param name="toMP">Terminal measurement point at the 'to' end.</param>
+    /// <param name="fromBusID">Bus identifier at the 'from' end.</param>
+    /// <param name="toBusID">Bus identifier at the 'to' end.</param>
+    /// <returns>A tuple with normalized endpoint values ensuring MP and Bus are on the same side.</returns>
+    private static (string FromMP, string ToMP, string FromBusID, string ToBusID) NormalizeLineEndpoints(
+        string fromMP, string toMP, string fromBusID, string toBusID)
+    {
+        bool hasFromData = !string.IsNullOrWhiteSpace(fromMP) || !string.IsNullOrWhiteSpace(fromBusID);
+        bool hasToData = !string.IsNullOrWhiteSpace(toMP) || !string.IsNullOrWhiteSpace(toBusID);
+
+        if (hasFromData && !hasToData)
+        {
+            if (string.IsNullOrWhiteSpace(fromMP) && !string.IsNullOrWhiteSpace(toMP))
+            {
+                fromMP = toMP;
+                toMP = string.Empty;
+            }
+            if (string.IsNullOrWhiteSpace(fromBusID) && !string.IsNullOrWhiteSpace(toBusID))
+            {
+                fromBusID = toBusID;
+                toBusID = string.Empty;
+            }
+        }
+        else if (!hasFromData && hasToData)
+        {
+            if (string.IsNullOrWhiteSpace(toMP) && !string.IsNullOrWhiteSpace(fromMP))
+            {
+                toMP = fromMP;
+                fromMP = string.Empty;
+            }
+            if (string.IsNullOrWhiteSpace(toBusID) && !string.IsNullOrWhiteSpace(fromBusID))
+            {
+                toBusID = fromBusID;
+                fromBusID = string.Empty;
+            }
+        }
+
+        return (fromMP, toMP, fromBusID, toBusID);
+    }
+
+    /// <summary>
     /// Derives transmission lines from line-terminal (_P_/_Q_) PMU devices. Parses the
     /// device Name "STATION-REMOTE {KV}KV" to identify from/to station connections,
     /// matches them to buses, and looks up terminal measurement points from the
@@ -1051,12 +1095,20 @@ public static class PowerSystemModelExporter
 
         foreach ((string lineID, LineEndpoints endpoints) in lineEndpoints)
         {
+            string fromMP = endpoints.FromMP ?? string.Empty;
+            string toMP = endpoints.ToMP ?? string.Empty;
+            string fromBusID = endpoints.FromBusID ?? string.Empty;
+            string toBusID = endpoints.ToBusID ?? string.Empty;
+
+            // Ensure consistency: if only one side has data, both MP and Bus must be on the same side
+            (fromMP, toMP, fromBusID, toBusID) = NormalizeLineEndpoints(fromMP, toMP, fromBusID, toBusID);
+
             lines.Add(new LineRow(
                 LineID: lineID,
-                FromTerminalMP: endpoints.FromMP ?? string.Empty,
-                ToTerminalMP: endpoints.ToMP ?? string.Empty,
-                FromBusID: endpoints.FromBusID ?? string.Empty,
-                ToBusID: endpoints.ToBusID ?? string.Empty,
+                FromTerminalMP: fromMP,
+                ToTerminalMP: toMP,
+                FromBusID: fromBusID,
+                ToBusID: toBusID,
                 NominalVoltageKV: endpoints.NominalKV
             ));
         }
@@ -1174,14 +1226,25 @@ public static class PowerSystemModelExporter
                 // Determine from/to based on alphabetical order
                 bool isFromEnd = string.Compare(stationID, remoteID, StringComparison.OrdinalIgnoreCase) <= 0;
 
-                string fromMP = isFromEnd ? mp : string.Empty;
-                string toMP = isFromEnd ? string.Empty : mp;
-                string fromBusID = isFromEnd && idBusMap.ContainsKey(localBusID) ? localBusID : (idBusMap.ContainsKey(remoteBusID) ? remoteBusID : string.Empty);
-                string toBusID = !isFromEnd && idBusMap.ContainsKey(localBusID) ? localBusID : (idBusMap.ContainsKey(remoteBusID) ? remoteBusID : string.Empty);
+                // Assign MP and Bus based on alphabetical ordering
+                string fromMP, toMP, fromBusID, toBusID;
 
-                // Swap if needed to maintain from/to consistency
-                if (!isFromEnd)
-                    (fromBusID, toBusID) = (toBusID, fromBusID);
+                if (isFromEnd)
+                {
+                    // This DFR is at the "from" end (alphabetically first station)
+                    fromMP = mp;
+                    toMP = string.Empty;
+                    fromBusID = idBusMap.ContainsKey(localBusID) ? localBusID : string.Empty;
+                    toBusID = idBusMap.ContainsKey(remoteBusID) ? remoteBusID : string.Empty;
+                }
+                else
+                {
+                    // This DFR is at the "to" end (alphabetically second station)
+                    fromMP = string.Empty;
+                    toMP = mp;
+                    fromBusID = idBusMap.ContainsKey(remoteBusID) ? remoteBusID : string.Empty;
+                    toBusID = idBusMap.ContainsKey(localBusID) ? localBusID : string.Empty;
+                }
 
                 existingLines.Add(new LineRow(
                     LineID: lineID,
