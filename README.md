@@ -1,4 +1,4 @@
-﻿# SynchroWave STTP Configuration Exporter
+﻿# SynchroWave Configuration Exporter
 
 A .NET console application that exports synchrophasor data configurations from Grid Protection Alliance (GPA) applications (such as openHistorian, openPDC, or SIEGate) to formats compatible with SEL SynchroWave visualization system.
 
