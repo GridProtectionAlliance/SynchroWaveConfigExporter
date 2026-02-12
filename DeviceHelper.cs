@@ -52,11 +52,16 @@ public static class DeviceHelper
     {
         return (signalType ?? string.Empty).Trim().ToUpperInvariant() is "FREQ" or "DFDT";
     }
-    // ========= Device Type Identification =========
 
-    // TODO:
-    // Many of the following methods are specific to Entergy's synchrophasor naming
-    // conventions and will need to be adapted for other utilities or data sources:
+    // ======================================================================================
+    //
+    //    TODO:
+    //      Many of the following methods are specific to Entergy's synchrophasor naming
+    //      conventions and will need to be adapted for other utilities or data sources:
+    //
+    // ======================================================================================
+
+    // ========= Device Type Identification =========
 
     /// <summary>
     /// Checks if a device is a PMU (line-terminal) device based on naming convention.
