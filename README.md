@@ -6,7 +6,7 @@ A .NET console application that exports synchrophasor data configurations from G
 
 The `SynchroWaveConfigExporter` tool generates multiple CSV export files for use with SEL's SynchroWave Operations visualization platform:
 
-1. **STTP Signal Mappings** - Maps synchrophasor measurements to SEL SynchroWave Operations signal identifiers for the IEEE 2664 data transport standard. This allows SEL SynchroWave Operations to automatically injest all available measurements without manual configuration.
+1. **STTP Signal Mappings** - Maps synchrophasor measurements to SEL SynchroWave Operations signal identifiers for the IEEE 2664 data transport standard. This allows SEL SynchroWave Operations to automatically ingest all available measurements without manual configuration.
 2. **Power System Model** - Exports station, bus, and line topology information.
 3. **Dash Menu** - Creates hierarchical folder structures for organizing visualizations, e.g., by station and voltage level.
 
