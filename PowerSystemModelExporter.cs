@@ -78,29 +78,72 @@ public static class PowerSystemModelExporter
         (Dictionary<string, string> terminalMPs, Dictionary<string, List<DFRLineInfo>> deviceDFRLinesMap) = LoadTerminalMeasurementPointsAndDFRLines();
 
         // 3) Derive stations by grouping devices on GPS coordinates
-        (List<StationRow> stations, int coordGroupsFound, int skippedNoName, int skippedNoVoltage) = DeriveStations(devices, idPhasorMap);
+        (List<StationRow> stations, int coordGroupsFound, int skippedNoName, int skippedNoVoltage, List<string> skippedNoNameDetails, List<string> skippedNoVoltageDetails) = DeriveStations(devices, idPhasorMap);
 
         // Build lookup: StationId => StationRow
         Dictionary<string, StationRow> idStationMap = stations.ToDictionary(
             station => station.StationID, station => station, StringComparer.OrdinalIgnoreCase);
 
-        // 4) Derive buses: station + distinct voltage levels
-        List<BusRow> buses = DeriveBuses(devices, idStationMap, idPhasorMap);
+        // 4) Collect bus-voltage measurement points and build the canonical bus map: a bus is named
+        //    after its voltage measurement point when exactly one exists at a station and voltage,
+        //    so connected lines reference the measured bus.
+        Dictionary<string, Dictionary<string, int>> deviceLabelVoltages = BuildDeviceLabelVoltages(devices, idPhasorMap);
+
+        List<(string Station, int KV, string MeasurementPoint)> busMeasurementPoints =
+            CollectBusMeasurementPoints(devices, idStationMap, deviceDFRLinesMap, deviceLabelVoltages, idPhasorMap);
+
+        Dictionary<string, string> canonicalBus = BuildCanonicalBusMap(busMeasurementPoints);
+
+        // 5) Derive buses: one per station + distinct voltage level (named via the canonical map)
+        List<BusRow> buses = DeriveBuses(devices, idStationMap, idPhasorMap, canonicalBus);
 
         // Build lookup: BusId => BusRow
         Dictionary<string, BusRow> idBusMap = buses.ToDictionary(
             bus => bus.BusID, bus => bus, StringComparer.OrdinalIgnoreCase);
 
-        // 5) Derive lines from line-terminal, PMU-style, devices
-        List<LineRow> lines = DeriveLines(devices, idStationMap, idBusMap, terminalMPs, idPhasorMap);
+        // 6) Derive lines from measured terminals (PMU devices, DFR phasor labels, and transformers).
+        //    Each terminal's measurement point is paired with its own bus on the same side, and
+        //    notional buses are generated on demand to serve as that anchor.
+        (List<LineRow> lines, int dfrLinesAdded, HashSet<string> usedTerminalMPs, HashSet<string> unmatchedRemotes, HashSet<string> candidateTerminalMPs) =
+            DeriveLines(devices, idStationMap, idBusMap, buses, terminalMPs, deviceDFRLinesMap, idPhasorMap, canonicalBus);
 
-        // 6) Derive additional lines from DFR style devices using phasor labels
-        int dfrLinesAdded = DeriveDFRLines(devices, idStationMap, idBusMap, terminalMPs, idPhasorMap, deviceDFRLinesMap, lines);
+        // 7) Ensure every bus-voltage measurement point has a matching bus identifier
+        AddBusMeasurementPointRows(busMeasurementPoints, idStationMap, idBusMap, buses);
 
-        // 7) Compute adjacent bus IDs from line connections
+        HashSet<string> busMeasurementPointNames = new(busMeasurementPoints.Select(point => point.MeasurementPoint), StringComparer.OrdinalIgnoreCase);
+
+        // 7b) Drop notional buses left unreferenced once lines bind to their specific measured buses
+        PruneUnreferencedNotionalBuses(buses, idBusMap, lines, busMeasurementPointNames);
+
+        // 8) Reconcile station nominal voltages with any buses generated during derivation
+        ReconcileStationVoltages(stations, buses);
+
+        // 9) Compute adjacent bus IDs from line connections
         ComputeAdjacentBuses(buses, lines);
 
-        // 8) Write output CSVs
+        // 10) Report measurement points anchored to neither a line terminal nor a bus, then validate
+        Dictionary<string, MeasurementPointInfo> allMeasurementPoints = LoadAllMeasurementPoints();
+
+        HashSet<string> anchoredMeasurementPoints = new(usedTerminalMPs, StringComparer.OrdinalIgnoreCase);
+
+        foreach (BusRow bus in buses)
+            anchoredMeasurementPoints.Add(bus.BusID);
+
+        (int orphanCount, string orphanSummary, List<string> orphanGenuineGaps) =
+            AnalyzeOrphanMeasurementPoints(allMeasurementPoints, anchoredMeasurementPoints, candidateTerminalMPs);
+        List<string> invariantViolations = CheckModelInvariants(stations, buses, lines);
+        List<string> possibleTypos = FindPossibleTypos(unmatchedRemotes, idStationMap);
+        List<string> powerCalcGaps = AnalyzePowerCalcCoverage(lines, allMeasurementPoints, busMeasurementPointNames);
+
+        // 9) Sort stations and buses for stable, readable output files
+        stations.Sort((left, right) => string.Compare(left.StationID, right.StationID, StringComparison.OrdinalIgnoreCase));
+        buses.Sort((left, right) =>
+        {
+            int byStation = string.Compare(left.StationID, right.StationID, StringComparison.OrdinalIgnoreCase);
+            return byStation != 0 ? byStation : left.NominalVoltageKV.CompareTo(right.NominalVoltageKV);
+        });
+
+        // 10) Write output CSVs
         string stationsPath = Settings.StationsCsvPath;
         string busesPath = Settings.BusesCsvPath;
         string linesPath = Settings.LinesCsvPath;
@@ -122,6 +165,14 @@ public static class PowerSystemModelExporter
             DFRLinesAdded: dfrLinesAdded,
             StationsSkippedNoName: skippedNoName,
             StationsSkippedNoVoltage: skippedNoVoltage,
+            SkippedNoNameDetails: skippedNoNameDetails,
+            SkippedNoVoltageDetails: skippedNoVoltageDetails,
+            OrphanMeasurementPoints: orphanCount,
+            OrphanMeasurementPointSummary: orphanSummary,
+            OrphanGenuineGaps: orphanGenuineGaps,
+            InvariantViolations: invariantViolations,
+            PossibleTypos: possibleTypos,
+            PowerCalcGaps: powerCalcGaps,
             StationsPath: stationsPath,
             BusesPath: busesPath,
             LinesPath: linesPath,
@@ -148,6 +199,14 @@ public static class PowerSystemModelExporter
     /// <param name="DFRLinesAdded">The number of additional transmission lines derived from DFR devices.</param>
     /// <param name="StationsSkippedNoName">The number of potential stations skipped due to inability to extract a valid station name.</param>
     /// <param name="StationsSkippedNoVoltage">The number of potential stations skipped due to no valid voltage level being found.</param>
+    /// <param name="SkippedNoNameDetails">Details of coordinate groups skipped because no station name could be extracted.</param>
+    /// <param name="SkippedNoVoltageDetails">Details (station + devices) of stations skipped because no voltage could be resolved.</param>
+    /// <param name="OrphanMeasurementPoints">The number of signal-mapping measurement points anchored to neither a line terminal nor a bus.</param>
+    /// <param name="OrphanMeasurementPointSummary">A classification breakdown of the unanchored measurement points (redundant duplicates vs genuine gaps).</param>
+    /// <param name="OrphanGenuineGaps">Unanchored complete (voltage + current) terminals that were never modelable — the actionable gaps.</param>
+    /// <param name="InvariantViolations">Power system model rule violations detected in the derived model (empty when consistent).</param>
+    /// <param name="PossibleTypos">Likely source-data spelling inconsistencies (remote names or stations within one edit of each other).</param>
+    /// <param name="PowerCalcGaps">Line terminals whose current has no usable voltage source (no own voltage and a notional bus), so SEL cannot compute power.</param>
     /// <param name="StationsPath">The file path where the stations CSV file was written.</param>
     /// <param name="BusesPath">The file path where the buses CSV file was written.</param>
     /// <param name="LinesPath">The file path where the lines CSV file was written.</param>
@@ -167,6 +226,14 @@ public static class PowerSystemModelExporter
         int DFRLinesAdded,
         int StationsSkippedNoName,
         int StationsSkippedNoVoltage,
+        List<string> SkippedNoNameDetails,
+        List<string> SkippedNoVoltageDetails,
+        int OrphanMeasurementPoints,
+        string OrphanMeasurementPointSummary,
+        List<string> OrphanGenuineGaps,
+        List<string> InvariantViolations,
+        List<string> PossibleTypos,
+        List<string> PowerCalcGaps,
         string StationsPath,
         string BusesPath,
         string LinesPath,
@@ -246,9 +313,10 @@ public static class PowerSystemModelExporter
         public required decimal Longitude { get; init; }
         
         /// <summary>
-        /// Gets the nominal voltage level in kV (the maximum voltage level found at this station).
+        /// Gets or sets the nominal voltage level in kV (the maximum voltage level found at this
+        /// station, reconciled against any buses generated during line derivation).
         /// </summary>
-        public required int NominalVoltageKV { get; init; }
+        public required int NominalVoltageKV { get; set; }
     }
 
     /// <summary>
@@ -303,43 +371,6 @@ public static class PowerSystemModelExporter
         string FromBusID,
         string ToBusID,
         int NominalVoltageKV);
-
-    /// <summary>
-    /// Tracks the two endpoints of a transmission line during line derivation.
-    /// Used internally to aggregate information from devices at both ends of a line.
-    /// </summary>
-    /// <remarks>
-    /// Since a transmission line may have PMU/DFR devices at both endpoints, this class
-    /// is used to collect endpoint information from multiple device records before creating
-    /// the final <see cref="LineRow"/> record.
-    /// </remarks>
-    private sealed class LineEndpoints
-    {
-        /// <summary>
-        /// Gets or sets the terminal measurement point identifier at the 'from' end.
-        /// </summary>
-        public string? FromMP { get; set; }
-        
-        /// <summary>
-        /// Gets or sets the terminal measurement point identifier at the 'to' end.
-        /// </summary>
-        public string? ToMP { get; set; }
-        
-        /// <summary>
-        /// Gets or sets the bus identifier at the 'from' end.
-        /// </summary>
-        public string? FromBusID { get; set; }
-        
-        /// <summary>
-        /// Gets or sets the bus identifier at the 'to' end.
-        /// </summary>
-        public string? ToBusID { get; set; }
-        
-        /// <summary>
-        /// Gets the nominal voltage level of this line in kV.
-        /// </summary>
-        public int NominalKV { get; init; }
-    }
 
     /// <summary>
     /// Information about a DFR line extracted from the signal mappings CSV.
@@ -695,7 +726,7 @@ public static class PowerSystemModelExporter
     /// all phasors at that location.
     /// </para>
     /// </remarks>
-    private static (List<StationRow> Stations, int CoordinateGroupsFound, int SkippedNoName, int SkippedNoVoltage) DeriveStations(List<DeviceRecord> devices, Dictionary<int, PhasorRecord> idPhasorMap)
+    private static (List<StationRow> Stations, int CoordinateGroupsFound, int SkippedNoName, int SkippedNoVoltage, List<string> SkippedNoNameDetails, List<string> SkippedNoVoltageDetails) DeriveStations(List<DeviceRecord> devices, Dictionary<int, PhasorRecord> idPhasorMap)
     {
         // Coordinate key: (rounded lat, rounded lon) round to 2 decimal places (~1.1km)
         // to handle GPS variations between devices at the same station
@@ -717,6 +748,8 @@ public static class PowerSystemModelExporter
         int coordinateGroupsFound = coordinateDeviceMap.Count;
         int skippedNoName = 0;
         int skippedNoVoltage = 0;
+        List<string> skippedNoNameDetails = [];
+        List<string> skippedNoVoltageDetails = [];
         List<StationRow> stations = [];
 
         foreach ((string _, List<DeviceRecord> group) in coordinateDeviceMap)
@@ -822,6 +855,7 @@ public static class PowerSystemModelExporter
             if (string.IsNullOrWhiteSpace(stationName))
             {
                 skippedNoName++;
+                skippedNoNameDetails.Add($"devices [{string.Join(", ", group.Select(device => device.Acronym))}] @ {group[0].Latitude:F2},{group[0].Longitude:F2}");
                 continue;
             }
 
@@ -830,6 +864,7 @@ public static class PowerSystemModelExporter
             if (string.IsNullOrWhiteSpace(stationID))
             {
                 skippedNoName++;
+                skippedNoNameDetails.Add($"\"{stationName}\" devices [{string.Join(", ", group.Select(device => device.Acronym))}]");
                 continue;
             }
 
@@ -850,6 +885,7 @@ public static class PowerSystemModelExporter
             if (maxKV == 0)
             {
                 skippedNoVoltage++;
+                skippedNoVoltageDetails.Add($"{stationID} (devices: {string.Join(", ", group.Select(device => device.Acronym))})");
                 continue;
             }
 
@@ -866,7 +902,7 @@ public static class PowerSystemModelExporter
             });
         }
 
-        return (stations.OrderBy(station => station.StationID, StringComparer.OrdinalIgnoreCase).ToList(), coordinateGroupsFound, skippedNoName, skippedNoVoltage);
+        return (stations.OrderBy(station => station.StationID, StringComparer.OrdinalIgnoreCase).ToList(), coordinateGroupsFound, skippedNoName, skippedNoVoltage, skippedNoNameDetails, skippedNoVoltageDetails);
     }
 
     // ========= Bus derivation =========
@@ -878,6 +914,7 @@ public static class PowerSystemModelExporter
     /// <param name="devices">The list of device records to analyze.</param>
     /// <param name="idStationMap">A dictionary mapping station IDs to station records.</param>
     /// <param name="idPhasorMap">A dictionary mapping phasor IDs to phasor records (for voltage resolution).</param>
+    /// <param name="canonicalBus">A map from "station|kv" to the preferred bus identifier (a bus-voltage measurement point name when unique, otherwise the notional bus name).</param>
     /// <returns>A list of derived bus records, sorted by station ID and then by voltage level.</returns>
     /// <remarks>
     /// Each unique combination of station and voltage level produces one bus record.
@@ -886,7 +923,8 @@ public static class PowerSystemModelExporter
     private static List<BusRow> DeriveBuses(
         List<DeviceRecord> devices,
         Dictionary<string, StationRow> idStationMap,
-        Dictionary<int, PhasorRecord> idPhasorMap)
+        Dictionary<int, PhasorRecord> idPhasorMap,
+        Dictionary<string, string> canonicalBus)
     {
         // Map each device to its station via coordinates
         Dictionary<string, HashSet<int>> stationVoltagesMap = new(StringComparer.OrdinalIgnoreCase);
@@ -922,7 +960,7 @@ public static class PowerSystemModelExporter
             {
                 buses.Add(new BusRow
                 {
-                    BusID = $"{stationID}_{kv}_BUS",
+                    BusID = CanonicalBusId(stationID, kv, canonicalBus),
                     StationID = stationID,
                     NominalVoltageKV = kv
                 });
@@ -935,335 +973,1285 @@ public static class PowerSystemModelExporter
     // ========= Line derivation =========
 
     /// <summary>
-    /// Ensures line endpoint data is consistent: both MP and Bus must be on the same side when only one endpoint has data.
+    /// A single measured line terminal: the local station where a device sits, the remote
+    /// endpoint it observes, the resolved voltage, and the measurement point carrying that
+    /// terminal's current. Each PMU device yields one terminal; each distinct DFR phasor
+    /// label yields one terminal.
     /// </summary>
-    /// <param name="fromMP">Terminal measurement point at the 'from' end.</param>
-    /// <param name="toMP">Terminal measurement point at the 'to' end.</param>
-    /// <param name="fromBusID">Bus identifier at the 'from' end.</param>
-    /// <param name="toBusID">Bus identifier at the 'to' end.</param>
-    /// <returns>A tuple with normalized endpoint values ensuring MP and Bus are on the same side.</returns>
-    private static (string FromMP, string ToMP, string FromBusID, string ToBusID) NormalizeLineEndpoints(
-        string fromMP, string toMP, string fromBusID, string toBusID)
+    /// <param name="LocalStationID">Station identifier where the measuring device is located.</param>
+    /// <param name="RemoteRaw">Normalized remote endpoint name parsed from the device name or phasor label.</param>
+    /// <param name="NominalKV">Resolved nominal voltage level in kV for this terminal.</param>
+    /// <param name="MeasurementPoint">Measurement point identifier carrying this terminal's signals.</param>
+    /// <param name="FromDFR">Whether this terminal was derived from a DFR device (vs. a PMU device).</param>
+    /// <param name="LocalBusOverride">When the terminal's current is paired (via DestinationPhasorID) with a specific bus voltage, the measurement point of that bus; otherwise empty (use the canonical station/voltage bus).</param>
+    private sealed record Terminal(
+        string LocalStationID,
+        string RemoteRaw,
+        int NominalKV,
+        string MeasurementPoint,
+        bool FromDFR,
+        string LocalBusOverride);
+
+    /// <summary>
+    /// Collects the terminals that share a single two-station line so each measured end keeps
+    /// its own measurement point paired with its own station's bus.
+    /// </summary>
+    private sealed class PairGroup(string stationA, string stationB)
     {
-        bool hasFromData = !string.IsNullOrWhiteSpace(fromMP) || !string.IsNullOrWhiteSpace(fromBusID);
-        bool hasToData = !string.IsNullOrWhiteSpace(toMP) || !string.IsNullOrWhiteSpace(toBusID);
-
-        if (hasFromData && !hasToData)
-        {
-            if (string.IsNullOrWhiteSpace(fromMP) && !string.IsNullOrWhiteSpace(toMP))
-            {
-                fromMP = toMP;
-                toMP = string.Empty;
-            }
-            if (string.IsNullOrWhiteSpace(fromBusID) && !string.IsNullOrWhiteSpace(toBusID))
-            {
-                fromBusID = toBusID;
-                toBusID = string.Empty;
-            }
-        }
-        else if (!hasFromData && hasToData)
-        {
-            if (string.IsNullOrWhiteSpace(toMP) && !string.IsNullOrWhiteSpace(fromMP))
-            {
-                toMP = fromMP;
-                fromMP = string.Empty;
-            }
-            if (string.IsNullOrWhiteSpace(toBusID) && !string.IsNullOrWhiteSpace(fromBusID))
-            {
-                toBusID = fromBusID;
-                fromBusID = string.Empty;
-            }
-        }
-
-        return (fromMP, toMP, fromBusID, toBusID);
+        public string StationA { get; } = stationA;
+        public string StationB { get; } = stationB;
+        public List<Terminal> Terminals { get; } = [];
     }
 
     /// <summary>
-    /// Derives transmission lines from line-terminal (_P_/_Q_) PMU devices. Parses the
-    /// device Name "STATION-REMOTE {KV}KV" to identify from/to station connections,
-    /// matches them to buses, and looks up terminal measurement points from the
-    /// existing signal mappings.
+    /// Derives transmission lines from measured terminals (one per PMU device, one per distinct
+    /// DFR phasor label). A terminal's measurement point (the line current) and that terminal's
+    /// own bus are always emitted on the same side; the remote endpoint contributes a bus-only
+    /// anchor on the opposite side only when it resolves to a distinct, known station.
     /// </summary>
     /// <param name="devices">The list of device records to analyze.</param>
     /// <param name="idStationMap">A dictionary mapping station IDs to station records.</param>
-    /// <param name="idBusMap">A dictionary mapping bus IDs to bus records.</param>
+    /// <param name="idBusMap">A dictionary mapping bus IDs to bus records (extended on demand).</param>
+    /// <param name="buses">The bus list, appended to when a notional bus is generated on demand.</param>
     /// <param name="terminalMPs">A dictionary mapping device acronyms to terminal measurement point identifiers.</param>
+    /// <param name="deviceDFRLinesMap">A dictionary mapping DFR device acronyms to per-label line information.</param>
     /// <param name="idPhasorMap">A dictionary mapping phasor IDs to phasor records (for voltage resolution).</param>
-    /// <returns>A list of derived transmission line records, sorted by line ID.</returns>
+    /// <param name="canonicalBus">A map from "station|kv" to the preferred bus identifier (a bus-voltage measurement point name when unique, otherwise the notional bus name).</param>
+    /// <returns>The derived line records (sorted by line ID), the count derived from DFR terminals, the set of measurement points used as line terminals, the set of remote endpoint names that did not resolve to a known station, and the set of all measurement points considered as terminal candidates (emitted or dropped).</returns>
     /// <remarks>
-    /// <para>
-    /// Line endpoints are determined by alphabetical ordering of station names to ensure
-    /// consistent line identifiers regardless of which device is encountered first.
-    /// </para>
-    /// <para>
-    /// Terminal measurement points are looked up from the signal mappings CSV. If multiple
-    /// devices represent the same line (one at each end), their information is merged into
-    /// a single line record.
-    /// </para>
+    /// This keeps each terminal's measurement point paired with its bus, never produces a line
+    /// whose two ends share a bus or substation, and lets each measurement point appear at most
+    /// once across the file. Buses are generated on demand because the bus is a notional link
+    /// between a line terminal and its substation voltage and is not shown directly to the user.
     /// </remarks>
-    private static List<LineRow> DeriveLines(
+    private static (List<LineRow> Lines, int DFRDerived, HashSet<string> UsedMeasurementPoints, HashSet<string> UnmatchedRemotes, HashSet<string> CandidateTerminalMPs) DeriveLines(
         List<DeviceRecord> devices,
         Dictionary<string, StationRow> idStationMap,
         Dictionary<string, BusRow> idBusMap,
+        List<BusRow> buses,
         Dictionary<string, string> terminalMPs,
-        Dictionary<int, PhasorRecord> idPhasorMap)
+        Dictionary<string, List<DFRLineInfo>> deviceDFRLinesMap,
+        Dictionary<int, PhasorRecord> idPhasorMap,
+        Dictionary<string, string> canonicalBus)
     {
-        // Track line endpoints by line ID - each line may have two device records
-        // (one at each end), so we need to merge them
-        Dictionary<string, LineEndpoints> lineEndpoints = new(StringComparer.OrdinalIgnoreCase);
+        // Authoritative current-to-voltage pairing from the phasor graph (DestinationPhasorID):
+        // gives each DFR line current its correct voltage level and, when paired with a bus, the
+        // specific bus measurement point its power must be computed against.
+        Dictionary<string, Dictionary<string, (int Kv, string PairedBusMP)>> lineVoltagePairing =
+            BuildDeviceLineVoltagePairing(devices, deviceDFRLinesMap, idPhasorMap);
+
+        // 1) Collect measured terminals. PMU terminals are collected first so that, on a
+        //    measurement-point collision, the PMU terminal is the one that is kept.
+        List<Terminal> terminals = [];
 
         foreach (DeviceRecord device in devices)
         {
             if (!IsPMUDevice(device.Acronym))
                 continue;
 
-            // Parse the device Name to extract station, remote, and voltage
-            // Get fallback voltage from phasor data
-            int fallbackKV = device.Phasors
+            // Anchor the terminal to the station the device physically sits at (by coordinates),
+            // falling back to the parsed local name; require it to be a real station so its bus is valid.
+            string? station = FindStationForDevice(device, idStationMap);
+            string mp = terminalMPs.GetValueOrDefault(device.Acronym) ?? string.Empty;
+
+            int deviceKV = device.Phasors
                 .Select(phasor => ResolveVoltageKV(phasor, idPhasorMap))
                 .Where(kv => kv > 0)
                 .DefaultIfEmpty(0)
                 .Max();
 
-            DeviceHelper.LineParse? parsedLine = ParseLineFromDeviceName(device.Name, fallbackKV);
+            LineParse? parsedLine = ParseLineFromDeviceName(device.Name, deviceKV);
 
-            if (parsedLine is null)
+            string local = station ?? (parsedLine is null ? string.Empty : NormalizeToID(parsedLine.FromStation));
+
+            if (string.IsNullOrWhiteSpace(local) || !idStationMap.ContainsKey(local) || string.IsNullOrWhiteSpace(mp))
                 continue;
 
-            string fromStationID = NormalizeToID(parsedLine.FromStation);
-            string remoteStationID = NormalizeToID(parsedLine.ToRemote);
-
-            if (string.IsNullOrWhiteSpace(fromStationID))
-                continue;   
-
-            // Build a stable line ID from the two endpoints (alphabetical order)
-            string lineID = BuildLineID(fromStationID, remoteStationID);
-
-            // Look up from-bus at the device's voltage level (where this device is located)
-            string localBusID = $"{fromStationID}_{parsedLine.NominalKV}_BUS";
-
-            // Try to match remote name to a known station for the remote bus
-            string? matchedRemoteStationID = FindMatchingStation(remoteStationID, idStationMap);
-            string remoteBusID = matchedRemoteStationID is null ? 
-                string.Empty :
-                $"{matchedRemoteStationID}_{parsedLine.NominalKV}_BUS";
-
-            // Determine terminal MP from signal mappings
-            string mp = terminalMPs.GetValueOrDefault(device.Acronym) ?? string.Empty;
-
-            // Track this endpoint
-            if (!lineEndpoints.TryGetValue(lineID, out LineEndpoints? endpoints))
+            // PMU/inverter measurement points carry their own voltage and current together, so the
+            // terminal uses the canonical station bus (no specific bus override).
+            if (parsedLine is not null && parsedLine.NominalKV > 0)
             {
-                endpoints = new LineEndpoints { NominalKV = parsedLine.NominalKV };
-                lineEndpoints[lineID] = endpoints;
+                terminals.Add(new Terminal(local, NormalizeToID(parsedLine.ToRemote), parsedLine.NominalKV, mp, FromDFR: false, LocalBusOverride: string.Empty));
             }
-
-            // Determine which endpoint this device represents by comparing station IDs
-            // The "from" end is the one at the alphabetically first station
-            bool isFromEnd = string.Compare(fromStationID, remoteStationID, StringComparison.OrdinalIgnoreCase) <= 0;
-
-            if (isFromEnd)
+            else if (deviceKV > 0)
             {
-                // This device is at the "from" end of the line
-                if (string.IsNullOrWhiteSpace(endpoints.FromMP))
-                    endpoints.FromMP = mp;
-
-                if (string.IsNullOrWhiteSpace(endpoints.FromBusID) && idBusMap.ContainsKey(localBusID))
-                    endpoints.FromBusID = localBusID;
-
-                // Also set ToBusID from the remote if we know it
-                if (string.IsNullOrWhiteSpace(endpoints.ToBusID) && !string.IsNullOrWhiteSpace(remoteBusID) && idBusMap.ContainsKey(remoteBusID))
-                    endpoints.ToBusID = remoteBusID;
-            }
-            else
-            {
-                // This device is at the "to" end of the line (alphabetically second station)
-                if (string.IsNullOrWhiteSpace(endpoints.ToMP))
-                    endpoints.ToMP = mp;
-
-                if (string.IsNullOrWhiteSpace(endpoints.ToBusID) && idBusMap.ContainsKey(localBusID))
-                    endpoints.ToBusID = localBusID;
-
-                // Also set FromBusID from the remote if we know it
-                if (string.IsNullOrWhiteSpace(endpoints.FromBusID) && !string.IsNullOrWhiteSpace(remoteBusID) && idBusMap.ContainsKey(remoteBusID))
-                    endpoints.FromBusID = remoteBusID;
+                // A PMU/inverter device whose name does not parse a remote (e.g., a solar/wind
+                // generation source) is a line with only one end filled, so its point is anchored.
+                terminals.Add(new Terminal(local, string.Empty, deviceKV, mp, FromDFR: false, LocalBusOverride: string.Empty));
             }
         }
-
-        // Convert endpoints to LineRow records
-        List<LineRow> lines = [];
-
-        foreach ((string lineID, LineEndpoints endpoints) in lineEndpoints)
-        {
-            string fromMP = endpoints.FromMP ?? string.Empty;
-            string toMP = endpoints.ToMP ?? string.Empty;
-            string fromBusID = endpoints.FromBusID ?? string.Empty;
-            string toBusID = endpoints.ToBusID ?? string.Empty;
-
-            // Ensure consistency: if only one side has data, both MP and Bus must be on the same side
-            (fromMP, toMP, fromBusID, toBusID) = NormalizeLineEndpoints(fromMP, toMP, fromBusID, toBusID);
-
-            lines.Add(new LineRow(
-                LineID: lineID,
-                FromTerminalMP: fromMP,
-                ToTerminalMP: toMP,
-                FromBusID: fromBusID,
-                ToBusID: toBusID,
-                NominalVoltageKV: endpoints.NominalKV
-            ));
-        }
-
-        return lines.OrderBy(line => line.LineID, StringComparer.OrdinalIgnoreCase).ToList();
-    }
-
-    /// <summary>
-    /// Derives additional transmission lines from DFR devices using phasor labels
-    /// extracted from the signal mappings CSV.
-    /// </summary>
-    /// <param name="devices">The list of device records to analyze.</param>
-    /// <param name="idStationMap">A dictionary mapping station IDs to station records.</param>
-    /// <param name="idBusMap">A dictionary mapping bus IDs to bus records.</param>
-    /// <param name="terminalMPs">A dictionary mapping device acronyms to terminal measurement point identifiers.</param>
-    /// <param name="idPhasorMap">A dictionary mapping phasor IDs to phasor records (for voltage resolution).</param>
-    /// <param name="deviceDFRLinesMap">A dictionary mapping DFR device acronyms to lists of line information.</param>
-    /// <param name="existingLines">The list of existing line records to augment (lines are added to this list).</param>
-    /// <returns>The number of DFR-derived lines added to the existing lines list.</returns>
-    /// <remarks>
-    /// <para>
-    /// DFR line names are extracted from phasor labels in the signal mappings CSV and
-    /// typically represent the remote station name. Lines that look like buses or transformers
-    /// (containing "BUS", "AUTOTRAN", or "XFMR" in the name) are excluded.
-    /// </para>
-    /// <para>
-    /// Voltage levels are extracted from signal descriptions if available, otherwise
-    /// resolved from the device's phasor data.
-    /// </para>
-    /// <para>
-    /// Lines already present in the existing lines list (from PMU derivation) are skipped
-    /// to avoid duplicates.
-    /// </para>
-    /// </remarks>
-    private static int DeriveDFRLines(
-        List<DeviceRecord> devices,
-        Dictionary<string, StationRow> idStationMap,
-        Dictionary<string, BusRow> idBusMap,
-        Dictionary<string, string> terminalMPs,
-        Dictionary<int, PhasorRecord> idPhasorMap,
-        Dictionary<string, List<DFRLineInfo>> deviceDFRLinesMap,
-        List<LineRow> existingLines)
-    {
-        // Track existing line IDs to avoid duplicates
-        HashSet<string> existingLineIDs = new(existingLines.Select(l => l.LineID), StringComparer.OrdinalIgnoreCase);
-        int linesAdded = 0;
 
         foreach (DeviceRecord device in devices)
         {
             if (!IsDFRDevice(device.Acronym))
                 continue;
 
-            // Get the station this DFR is at
-            string? stationID = FindStationForDevice(device, idStationMap);
+            string? local = FindStationForDevice(device, idStationMap);
 
-            if (stationID is null)
+            if (local is null || !deviceDFRLinesMap.TryGetValue(device.Acronym, out List<DFRLineInfo>? dfrLines))
                 continue;
 
-            // Get DFR lines extracted from signal mappings
-            if (!deviceDFRLinesMap.TryGetValue(device.Acronym, out List<DFRLineInfo>? dfrLines))
-                continue;
-
-            foreach (DFRLineInfo lineInfo in dfrLines)
+            foreach (DFRLineInfo dfrLine in dfrLines)
             {
-                // The line name from DFR phasor labels is typically just the remote station name
-                // (e.g., "WPEC", "BOGALUSA_LN", "EAST_BUS")
-                string remoteID = NormalizeToID(lineInfo.LineName);
+                string remote = NormalizeToID(dfrLine.LineName);
 
-                if (string.IsNullOrWhiteSpace(remoteID))
+                // Bus labels become buses (handled separately) and transformer labels become
+                // transformer lines (handled separately); neither is a line to another station.
+                if (string.IsNullOrWhiteSpace(remote) || IsBusLabel(dfrLine.LineName) || IsTransformerLabel(dfrLine.LineName))
                     continue;
 
-                // Skip if this looks like a bus or transformer (not a line to another station)
-                if (remoteID.Contains("BUS", StringComparison.OrdinalIgnoreCase) ||
-                    remoteID.Contains("AUTOTRAN", StringComparison.OrdinalIgnoreCase) ||
-                    remoteID.Contains("XFMR", StringComparison.OrdinalIgnoreCase))
-                    continue;
+                // Prefer the voltage and paired bus from the phasor graph (authoritative) over the
+                // description-derived voltage and the station/voltage bus heuristic.
+                int pairedKv = 0;
+                string pairedBusMP = string.Empty;
 
-                // Build line ID
-                string lineID = BuildLineID(stationID, remoteID);
-
-                // Skip if this line already exists (from PMU derivation)
-                if (existingLineIDs.Contains(lineID))
-                    continue;
-
-                // Determine voltage level - use from line info if available, otherwise from device phasors
-                int nominalKV = lineInfo.VoltageKV;
-
-                if (nominalKV == 0)
+                if (lineVoltagePairing.TryGetValue(device.Acronym, out Dictionary<string, (int Kv, string PairedBusMP)>? deviceLineInfo) &&
+                    deviceLineInfo.TryGetValue(NormalizeToID(dfrLine.LineName), out (int Kv, string PairedBusMP) lineInfo))
                 {
-                    nominalKV = device.Phasors
-                        .Select(p => ResolveVoltageKV(p, idPhasorMap))
-                        .Where(kv => kv > 0)
-                        .DefaultIfEmpty(0)
-                        .Max();
+                    pairedKv = lineInfo.Kv;
+                    pairedBusMP = lineInfo.PairedBusMP;
                 }
 
-                if (nominalKV == 0)
+                int kv = pairedKv > 0
+                    ? pairedKv
+                    : dfrLine.VoltageKV > 0
+                        ? dfrLine.VoltageKV
+                        : device.Phasors.Select(phasor => ResolveVoltageKV(phasor, idPhasorMap)).Where(v => v > 0).DefaultIfEmpty(0).Max();
+
+                string mp = string.IsNullOrWhiteSpace(dfrLine.MeasurementPoint)
+                    ? terminalMPs.GetValueOrDefault(device.Acronym) ?? string.Empty
+                    : dfrLine.MeasurementPoint;
+
+                if (string.IsNullOrWhiteSpace(mp) || kv <= 0)
                     continue;
 
-                // Build bus IDs
-                string localBusID = $"{stationID}_{nominalKV}_BUS";
-
-                // Try to find matching remote station
-                string? matchedRemoteID = FindMatchingStation(remoteID, idStationMap);
-                string remoteBusID = matchedRemoteID is not null ? 
-                    $"{matchedRemoteID}_{nominalKV}_BUS" : 
-                    string.Empty;
-
-                // Determine terminal MP
-                string mp = lineInfo.MeasurementPoint;
-
-                if (string.IsNullOrWhiteSpace(mp))
-                    mp = terminalMPs.GetValueOrDefault(device.Acronym) ?? string.Empty;
-
-                // Determine from/to based on alphabetical order
-                bool isFromEnd = string.Compare(stationID, remoteID, StringComparison.OrdinalIgnoreCase) <= 0;
-
-                // Assign MP and Bus based on alphabetical ordering
-                string fromMP, toMP, fromBusID, toBusID;
-
-                if (isFromEnd)
-                {
-                    // This DFR is at the "from" end (alphabetically first station)
-                    fromMP = mp;
-                    toMP = string.Empty;
-                    fromBusID = idBusMap.ContainsKey(localBusID) ? localBusID : string.Empty;
-                    toBusID = idBusMap.ContainsKey(remoteBusID) ? remoteBusID : string.Empty;
-                }
-                else
-                {
-                    // This DFR is at the "to" end (alphabetically second station)
-                    fromMP = string.Empty;
-                    toMP = mp;
-                    fromBusID = idBusMap.ContainsKey(remoteBusID) ? remoteBusID : string.Empty;
-                    toBusID = idBusMap.ContainsKey(localBusID) ? localBusID : string.Empty;
-                }
-
-                existingLines.Add(new LineRow(
-                    LineID: lineID,
-                    FromTerminalMP: fromMP,
-                    ToTerminalMP: toMP,
-                    FromBusID: fromBusID,
-                    ToBusID: toBusID,
-                    NominalVoltageKV: nominalKV
-                ));
-
-                existingLineIDs.Add(lineID);
-                linesAdded++;
+                terminals.Add(new Terminal(local, remote, kv, mp, FromDFR: true, LocalBusOverride: pairedBusMP));
             }
         }
 
-        // Re-sort the lines list after adding DFR lines
-        existingLines.Sort((a, b) => string.Compare(a.LineID, b.LineID, StringComparison.OrdinalIgnoreCase));
+        // Every measurement point considered as a line terminal (emitted or not). An orphan that
+        // is in this set was a real terminal candidate that lost to another point at the same
+        // terminal (a redundant duplicate); an orphan not in this set was never modelable as a line.
+        HashSet<string> candidateTerminalMPs = new(terminals.Select(terminal => terminal.MeasurementPoint), StringComparer.OrdinalIgnoreCase);
 
-        return linesAdded;
+        // 2) Each measurement point identifies one physical terminal: keep its first occurrence.
+        List<Terminal> distinctTerminals = [];
+        HashSet<string> seenMPs = new(StringComparer.OrdinalIgnoreCase);
+
+        foreach (Terminal terminal in terminals)
+        {
+            if (seenMPs.Add(terminal.MeasurementPoint))
+                distinctTerminals.Add(terminal);
+        }
+
+        // 3) Group terminals that share a real two-station pair; everything else is single-ended.
+        Dictionary<string, PairGroup> pairGroups = new(StringComparer.OrdinalIgnoreCase);
+        List<Terminal> singleEnded = [];
+
+        // Remote endpoint names that did not resolve to any known station. Some are genuine
+        // external/unmodeled stations; ones that closely resemble a known station are likely
+        // source-data spelling typos and are reported as such.
+        HashSet<string> unmatchedRemotes = new(StringComparer.OrdinalIgnoreCase);
+
+        foreach (Terminal terminal in distinctTerminals)
+        {
+            string? remoteStation = string.IsNullOrWhiteSpace(terminal.RemoteRaw)
+                ? null
+                : FindKnownStation(terminal.RemoteRaw, idStationMap);
+
+            if (remoteStation is not null && !remoteStation.Equals(terminal.LocalStationID, StringComparison.OrdinalIgnoreCase))
+            {
+                // Order the pair the same way BuildLineID does so the key is stable from either end.
+                string upperLocal = terminal.LocalStationID.ToUpperInvariant();
+                string upperRemote = remoteStation.ToUpperInvariant();
+                (string stationA, string stationB) = string.Compare(upperLocal, upperRemote, StringComparison.Ordinal) <= 0
+                    ? (upperLocal, upperRemote)
+                    : (upperRemote, upperLocal);
+
+                string key = $"{stationA}_{stationB}";
+
+                if (!pairGroups.TryGetValue(key, out PairGroup? group))
+                {
+                    group = new PairGroup(stationA, stationB);
+                    pairGroups[key] = group;
+                }
+
+                group.Terminals.Add(terminal);
+            }
+            else
+            {
+                if (!string.IsNullOrWhiteSpace(terminal.RemoteRaw) && remoteStation is null)
+                    unmatchedRemotes.Add(terminal.RemoteRaw);
+
+                singleEnded.Add(terminal);
+            }
+        }
+
+        List<LineRow> lines = [];
+        HashSet<string> usedLineIDs = new(StringComparer.OrdinalIgnoreCase);
+        HashSet<string> usedMPs = new(StringComparer.OrdinalIgnoreCase);
+        int dfrDerived = 0;
+
+        // 3a) Two-station lines: each present terminal keeps its MP with its own station's bus;
+        //     an unmeasured end contributes only its anchor bus.
+        foreach ((string lineID, PairGroup group) in pairGroups)
+        {
+            int kv = group.Terminals.Max(terminal => terminal.NominalKV);
+
+            Terminal? termA = group.Terminals.FirstOrDefault(terminal => terminal.LocalStationID.Equals(group.StationA, StringComparison.OrdinalIgnoreCase));
+            Terminal? termB = group.Terminals.FirstOrDefault(terminal => terminal.LocalStationID.Equals(group.StationB, StringComparison.OrdinalIgnoreCase));
+
+            string fromMP = termA?.MeasurementPoint ?? string.Empty;
+            string toMP = termB?.MeasurementPoint ?? string.Empty;
+
+            lines.Add(new LineRow(
+                LineID: MakeUniqueLineID(lineID, usedLineIDs),
+                FromTerminalMP: fromMP,
+                ToTerminalMP: toMP,
+                FromBusID: ResolveTerminalBus(termA?.LocalBusOverride, group.StationA, kv, idStationMap, idBusMap, buses, canonicalBus),
+                ToBusID: ResolveTerminalBus(termB?.LocalBusOverride, group.StationB, kv, idStationMap, idBusMap, buses, canonicalBus),
+                NominalVoltageKV: kv));
+
+            if (!string.IsNullOrWhiteSpace(fromMP))
+                usedMPs.Add(fromMP);
+
+            if (!string.IsNullOrWhiteSpace(toMP))
+                usedMPs.Add(toMP);
+
+            if ((termA?.FromDFR ?? false) || (termB?.FromDFR ?? false))
+                dfrDerived++;
+        }
+
+        // 3b) Single-ended lines: measured terminal (MP + its bus) on the From side, remote blank.
+        foreach (Terminal terminal in singleEnded)
+        {
+            string baseID = string.IsNullOrWhiteSpace(terminal.RemoteRaw) || terminal.RemoteRaw.Equals(terminal.LocalStationID, StringComparison.OrdinalIgnoreCase)
+                ? terminal.LocalStationID
+                : BuildLineID(terminal.LocalStationID, terminal.RemoteRaw);
+
+            lines.Add(new LineRow(
+                LineID: MakeUniqueLineID(baseID, usedLineIDs),
+                FromTerminalMP: terminal.MeasurementPoint,
+                ToTerminalMP: string.Empty,
+                FromBusID: ResolveTerminalBus(terminal.LocalBusOverride, terminal.LocalStationID, terminal.NominalKV, idStationMap, idBusMap, buses, canonicalBus),
+                ToBusID: string.Empty,
+                NominalVoltageKV: terminal.NominalKV));
+
+            usedMPs.Add(terminal.MeasurementPoint);
+
+            if (terminal.FromDFR)
+                dfrDerived++;
+        }
+
+        // 4) Transformer lines: pair a same-device HS/LS transformer into a line between its two
+        //    voltage buses (a transformer is a line between two voltage levels at one substation).
+        dfrDerived += DeriveTransformerLines(devices, idStationMap, idBusMap, buses, deviceDFRLinesMap, terminalMPs, idPhasorMap, canonicalBus, usedMPs, lines, usedLineIDs, candidateTerminalMPs, lineVoltagePairing);
+
+        return (lines.OrderBy(line => line.LineID, StringComparer.OrdinalIgnoreCase).ToList(), dfrDerived, usedMPs, unmatchedRemotes, candidateTerminalMPs);
+    }
+
+    /// <summary>
+    /// Ensures a bus exists for the given station and voltage, creating it on demand (the bus
+    /// is a notional voltage anchor for line terminals). Returns the bus identifier, or an
+    /// empty string when the station is unknown or the voltage is invalid. When a single
+    /// bus-voltage measurement point exists at the station and voltage, the bus is named after
+    /// that measurement point so SynchroWave can use the measured voltage on connected lines.
+    /// </summary>
+    private static string EnsureBus(
+        string stationID,
+        int kv,
+        Dictionary<string, StationRow> idStationMap,
+        Dictionary<string, BusRow> idBusMap,
+        List<BusRow> buses,
+        Dictionary<string, string> canonicalBus)
+    {
+        if (string.IsNullOrWhiteSpace(stationID) || kv <= 0 || !idStationMap.ContainsKey(stationID))
+            return string.Empty;
+
+        string busID = CanonicalBusId(stationID, kv, canonicalBus);
+
+        if (idBusMap.ContainsKey(busID))
+            return busID;
+
+        BusRow bus = new()
+        {
+            BusID = busID,
+            StationID = stationID,
+            NominalVoltageKV = kv
+        };
+
+        idBusMap[busID] = bus;
+        buses.Add(bus);
+
+        return busID;
+    }
+
+    /// <summary>
+    /// Resolves the bus identifier for a station and voltage: the single bus-voltage measurement
+    /// point name at that station/voltage when one exists (so connected lines reference the
+    /// measured bus), otherwise the notional "{StationId}_{kv}_BUS" name.
+    /// </summary>
+    private static string CanonicalBusId(string stationID, int kv, Dictionary<string, string> canonicalBus)
+    {
+        return canonicalBus.GetValueOrDefault($"{stationID}|{kv}", $"{stationID}_{kv}_BUS");
+    }
+
+    /// <summary>
+    /// For each device, maps a (phase-suffix-stripped, normalized) current phasor label to its
+    /// resolved voltage level and — when that current's paired voltage (via
+    /// <see cref="PhasorRecord.DestinationPhasorID"/>) is a bus — the measurement point of that bus.
+    /// This is the authoritative current-to-voltage pairing the SEL power monitor needs: a line
+    /// terminal's bus must be the bus whose voltage the terminal's current is actually paired with,
+    /// which a station-and-voltage heuristic cannot determine when a station has several buses at
+    /// one voltage.
+    /// </summary>
+    private static Dictionary<string, Dictionary<string, (int Kv, string PairedBusMP)>> BuildDeviceLineVoltagePairing(
+        List<DeviceRecord> devices,
+        Dictionary<string, List<DFRLineInfo>> deviceDFRLinesMap,
+        Dictionary<int, PhasorRecord> idPhasorMap)
+    {
+        Dictionary<string, Dictionary<string, (int, string)>> result = new(StringComparer.OrdinalIgnoreCase);
+
+        foreach (DeviceRecord device in devices)
+        {
+            // Bus label (normalized) -> bus measurement point for this device. The signal-mapping
+            // description label can differ from the Phasor.Label that DestinationPhasorID resolves
+            // to (e.g., description "115kV_BUS"/"230_EAST_BUS" vs Phasor.Label "OP_BUS"/"EAST_BUS"),
+            // so several keys are registered to make the lookup robust.
+            Dictionary<string, string> busLabelToMP = new(StringComparer.OrdinalIgnoreCase);
+            HashSet<string> distinctBusMPs = new(StringComparer.OrdinalIgnoreCase);
+
+            if (deviceDFRLinesMap.TryGetValue(device.Acronym, out List<DFRLineInfo>? dfrLines))
+            {
+                foreach (DFRLineInfo dfrLine in dfrLines)
+                {
+                    if (!IsBusLabel(dfrLine.LineName) || string.IsNullOrWhiteSpace(dfrLine.MeasurementPoint))
+                        continue;
+
+                    distinctBusMPs.Add(dfrLine.MeasurementPoint);
+
+                    string busKey = NormalizeToID(dfrLine.LineName);
+
+                    foreach (string key in new[] { busKey, StripVoltagePrefix(busKey) })
+                    {
+                        if (key.Length > 0 && !busLabelToMP.ContainsKey(key))
+                            busLabelToMP[key] = dfrLine.MeasurementPoint;
+                    }
+                }
+            }
+
+            // When a device has exactly one bus, every bus-voltage phasor label maps to that bus
+            // point — this covers Phasor.Label spellings that the description-derived keys missed.
+            if (distinctBusMPs.Count == 1)
+            {
+                string onlyBusMP = distinctBusMPs.First();
+
+                foreach (PhasorRecord phasor in device.Phasors)
+                {
+                    if (!IsBusLabel(phasor.Label))
+                        continue;
+
+                    string key = NormalizeToID(StripPhaseSuffix(phasor.Label));
+
+                    if (key.Length > 0 && !busLabelToMP.ContainsKey(key))
+                        busLabelToMP[key] = onlyBusMP;
+                }
+            }
+
+            Dictionary<string, (int, string)> labelInfo = new(StringComparer.OrdinalIgnoreCase);
+
+            foreach (PhasorRecord phasor in device.Phasors)
+            {
+                if (char.ToUpperInvariant(phasor.Type) != 'I')
+                    continue;
+
+                string key = NormalizeToID(StripPhaseSuffix(phasor.Label));
+
+                if (key.Length == 0)
+                    continue;
+
+                int kv = ResolveVoltageKV(phasor, idPhasorMap);
+                string pairedBusMP = string.Empty;
+
+                if (phasor.DestinationPhasorID.HasValue &&
+                    idPhasorMap.TryGetValue(phasor.DestinationPhasorID.Value, out PhasorRecord? destinationPhasor))
+                {
+                    string destinationKey = NormalizeToID(StripPhaseSuffix(destinationPhasor.Label));
+
+                    // The current is paired with a bus voltage (not its own line voltage).
+                    if (!destinationKey.Equals(key, StringComparison.OrdinalIgnoreCase) && IsBusLabel(destinationPhasor.Label))
+                    {
+                        pairedBusMP = busLabelToMP.GetValueOrDefault(destinationKey, string.Empty);
+
+                        if (string.IsNullOrWhiteSpace(pairedBusMP))
+                            pairedBusMP = busLabelToMP.GetValueOrDefault(StripVoltagePrefix(destinationKey), string.Empty);
+                    }
+                }
+
+                if (labelInfo.TryGetValue(key, out (int Kv, string PairedBusMP) existing))
+                {
+                    labelInfo[key] = (
+                        Math.Max(existing.Kv, kv),
+                        string.IsNullOrWhiteSpace(existing.PairedBusMP) ? pairedBusMP : existing.PairedBusMP);
+                }
+                else
+                {
+                    labelInfo[key] = (kv, pairedBusMP);
+                }
+            }
+
+            result[device.Acronym] = labelInfo;
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Removes a leading voltage prefix from a normalized label, e.g. "230_EAST_BUS" -&gt; "EAST_BUS"
+    /// or "115KV_N_BUS" -&gt; "N_BUS", so bus labels that carry a voltage prefix in one source but not
+    /// another still match.
+    /// </summary>
+    private static string StripVoltagePrefix(string label)
+    {
+        Match match = Regex.Match(label, @"^\d+(KV)?_(.+)$", RegexOptions.IgnoreCase);
+        return match.Success ? match.Groups[2].Value : label;
+    }
+
+    /// <summary>
+    /// Ensures a bus row exists for an explicitly named bus — the bus-voltage measurement point that
+    /// a line current is paired with — creating it on demand. Returns the bus identifier, or an
+    /// empty string when the station or voltage is invalid.
+    /// </summary>
+    private static string EnsureNamedBus(
+        string busID,
+        string stationID,
+        int kv,
+        Dictionary<string, StationRow> idStationMap,
+        Dictionary<string, BusRow> idBusMap,
+        List<BusRow> buses)
+    {
+        if (string.IsNullOrWhiteSpace(busID) || string.IsNullOrWhiteSpace(stationID) || kv <= 0 || !idStationMap.ContainsKey(stationID))
+            return string.Empty;
+
+        if (!idBusMap.ContainsKey(busID))
+        {
+            BusRow bus = new() { BusID = busID, StationID = stationID, NominalVoltageKV = kv };
+            idBusMap[busID] = bus;
+            buses.Add(bus);
+        }
+
+        return busID;
+    }
+
+    /// <summary>
+    /// Resolves a line terminal's bus: the specific bus its current is paired with when known
+    /// (created on demand), otherwise the canonical station/voltage bus.
+    /// </summary>
+    private static string ResolveTerminalBus(
+        string? busOverride,
+        string stationID,
+        int kv,
+        Dictionary<string, StationRow> idStationMap,
+        Dictionary<string, BusRow> idBusMap,
+        List<BusRow> buses,
+        Dictionary<string, string> canonicalBus)
+    {
+        return string.IsNullOrWhiteSpace(busOverride)
+            ? EnsureBus(stationID, kv, idStationMap, idBusMap, buses, canonicalBus)
+            : EnsureNamedBus(busOverride, stationID, kv, idStationMap, idBusMap, buses);
+    }
+
+    // ========= Possible-typo diagnostics =========
+
+    /// <summary>
+    /// Flags remote endpoint names that did not match a station but are within one edit of a known
+    /// station (e.g. a doubled letter), and pairs of known stations that are within one edit of each
+    /// other. These are likely source-data spelling inconsistencies that split one physical asset
+    /// across two identifiers; they are reported for review rather than merged automatically.
+    /// </summary>
+    /// <param name="unmatchedRemotes">Remote endpoint names that did not resolve to a known station.</param>
+    /// <param name="idStationMap">A dictionary mapping station IDs to station records.</param>
+    /// <returns>A list of human-readable "looks like a typo" messages.</returns>
+    private static List<string> FindPossibleTypos(IEnumerable<string> unmatchedRemotes, Dictionary<string, StationRow> idStationMap)
+    {
+        // Restrict to reasonably long names so short, legitimately-similar identifiers are not flagged.
+        const int MinLength = 5;
+
+        List<string> stations = idStationMap.Keys.Where(station => station.Length >= MinLength).ToList();
+        HashSet<string> seen = new(StringComparer.OrdinalIgnoreCase);
+        List<string> messages = [];
+
+        foreach (string remote in unmatchedRemotes.Where(remote => remote.Length >= MinLength).Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            foreach (string station in stations)
+            {
+                if (remote.Equals(station, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (WithinOneEdit(remote, station))
+                {
+                    string message = $"line endpoint \"{remote}\" closely resembles station \"{station}\"";
+
+                    if (seen.Add(message))
+                        messages.Add(message);
+                }
+            }
+        }
+
+        for (int i = 0; i < stations.Count; i++)
+        {
+            for (int j = i + 1; j < stations.Count; j++)
+            {
+                if (WithinOneEdit(stations[i], stations[j]))
+                {
+                    string message = $"stations \"{stations[i]}\" and \"{stations[j]}\" closely resemble each other";
+
+                    if (seen.Add(message))
+                        messages.Add(message);
+                }
+            }
+        }
+
+        return messages;
+    }
+
+    /// <summary>
+    /// Returns <c>true</c> when two identifiers differ by at most one single-character edit
+    /// (insertion, deletion, or substitution), compared case-insensitively.
+    /// </summary>
+    private static bool WithinOneEdit(string a, string b)
+    {
+        a = a.ToUpperInvariant();
+        b = b.ToUpperInvariant();
+
+        int lengthA = a.Length, lengthB = b.Length;
+
+        if (Math.Abs(lengthA - lengthB) > 1)
+            return false;
+
+        if (lengthA == lengthB)
+        {
+            int differences = 0;
+
+            for (int i = 0; i < lengthA; i++)
+            {
+                if (a[i] != b[i] && ++differences > 1)
+                    return false;
+            }
+
+            return differences == 1;
+        }
+
+        // Lengths differ by one: confirm the shorter is the longer with a single character removed.
+        string shorter = lengthA < lengthB ? a : b;
+        string longer = lengthA < lengthB ? b : a;
+
+        int s = 0, l = 0;
+        bool skipped = false;
+
+        while (s < shorter.Length && l < longer.Length)
+        {
+            if (shorter[s] == longer[l])
+            {
+                s++;
+                l++;
+            }
+            else if (skipped)
+            {
+                return false;
+            }
+            else
+            {
+                skipped = true;
+                l++;
+            }
+        }
+
+        return true;
+    }
+
+    // ========= Bus measurement points and transformers =========
+
+    /// <summary>Determines whether a phasor label/line name denotes a bus (a voltage node).</summary>
+    private static bool IsBusLabel(string? name)
+    {
+        return !string.IsNullOrWhiteSpace(name) && name.Contains("BUS", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Determines whether a phasor label/line name denotes a transformer terminal: a high-side
+    /// (<c>_HS</c>) or low-side (<c>_LS</c>) marker, or an explicit transformer name (XFMR/AUTOTRAN).
+    /// </summary>
+    private static bool IsTransformerLabel(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return false;
+
+        string upper = name.Trim().ToUpperInvariant();
+
+        return upper.EndsWith("_HS", StringComparison.Ordinal) ||
+               upper.EndsWith("_LS", StringComparison.Ordinal) ||
+               upper.Contains("XFMR", StringComparison.Ordinal) ||
+               upper.Contains("AUTOTRAN", StringComparison.Ordinal);
+    }
+
+    /// <summary>Returns "HS", "LS", or empty string for a transformer terminal's winding side.</summary>
+    private static string TransformerSide(string name)
+    {
+        string upper = name.Trim().ToUpperInvariant();
+
+        if (upper.EndsWith("_HS", StringComparison.Ordinal))
+            return "HS";
+
+        if (upper.EndsWith("_LS", StringComparison.Ordinal))
+            return "LS";
+
+        return string.Empty;
+    }
+
+    /// <summary>
+    /// Returns a transformer identity key from a terminal label by removing the winding-side
+    /// suffix, e.g. "AUTO_1_HS" and "AUTO_1_LS" both yield "AUTO_1".
+    /// </summary>
+    private static string TransformerKey(string name)
+    {
+        string id = NormalizeToID(name);
+
+        if (id.EndsWith("_HS", StringComparison.Ordinal) || id.EndsWith("_LS", StringComparison.Ordinal))
+            id = id[..^3];
+
+        return id;
+    }
+
+    /// <summary>
+    /// Builds, per device acronym, a map from a phasor label (phase suffix stripped, uppercased)
+    /// to the maximum resolved voltage level for that label. Used to assign the correct voltage to
+    /// bus and transformer terminals whose descriptions do not carry an explicit kV.
+    /// </summary>
+    private static Dictionary<string, Dictionary<string, int>> BuildDeviceLabelVoltages(
+        List<DeviceRecord> devices,
+        Dictionary<int, PhasorRecord> idPhasorMap)
+    {
+        Dictionary<string, Dictionary<string, int>> result = new(StringComparer.OrdinalIgnoreCase);
+
+        foreach (DeviceRecord device in devices)
+        {
+            Dictionary<string, int> labelKV = new(StringComparer.OrdinalIgnoreCase);
+
+            foreach (PhasorRecord phasor in device.Phasors)
+            {
+                string label = StripPhaseSuffix(phasor.Label).Trim().ToUpperInvariant();
+
+                if (label.Length == 0)
+                    continue;
+
+                int kv = ResolveVoltageKV(phasor, idPhasorMap);
+
+                if (kv > 0 && kv > labelKV.GetValueOrDefault(label))
+                    labelKV[label] = kv;
+            }
+
+            result[device.Acronym] = labelKV;
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Resolves the voltage for a DFR line/label entry, preferring the per-label phasor voltage,
+    /// then the voltage parsed from the description, then the device's maximum voltage.
+    /// </summary>
+    private static int ResolveLabelVoltage(
+        DeviceRecord device,
+        DFRLineInfo dfrLine,
+        Dictionary<string, Dictionary<string, int>> deviceLabelVoltages,
+        Dictionary<int, PhasorRecord> idPhasorMap)
+    {
+        if (deviceLabelVoltages.TryGetValue(device.Acronym, out Dictionary<string, int>? labelKV) &&
+            labelKV.TryGetValue(dfrLine.LineName.Trim().ToUpperInvariant(), out int labelVoltage) && labelVoltage > 0)
+            return labelVoltage;
+
+        if (dfrLine.VoltageKV > 0)
+            return dfrLine.VoltageKV;
+
+        return device.Phasors
+            .Select(phasor => ResolveVoltageKV(phasor, idPhasorMap))
+            .Where(kv => kv > 0)
+            .DefaultIfEmpty(0)
+            .Max();
+    }
+
+    /// <summary>
+    /// Collects bus-voltage measurement points (DFR labels denoting a bus) as (station, kV,
+    /// measurement point) tuples for use as named buses.
+    /// </summary>
+    private static List<(string Station, int KV, string MeasurementPoint)> CollectBusMeasurementPoints(
+        List<DeviceRecord> devices,
+        Dictionary<string, StationRow> idStationMap,
+        Dictionary<string, List<DFRLineInfo>> deviceDFRLinesMap,
+        Dictionary<string, Dictionary<string, int>> deviceLabelVoltages,
+        Dictionary<int, PhasorRecord> idPhasorMap)
+    {
+        List<(string, int, string)> result = [];
+
+        foreach (DeviceRecord device in devices)
+        {
+            string? station = FindStationForDevice(device, idStationMap);
+
+            if (station is null || !deviceDFRLinesMap.TryGetValue(device.Acronym, out List<DFRLineInfo>? dfrLines))
+                continue;
+
+            foreach (DFRLineInfo dfrLine in dfrLines)
+            {
+                if (!IsBusLabel(dfrLine.LineName) || string.IsNullOrWhiteSpace(dfrLine.MeasurementPoint))
+                    continue;
+
+                int kv = ResolveLabelVoltage(device, dfrLine, deviceLabelVoltages, idPhasorMap);
+
+                if (kv > 0)
+                    result.Add((station, kv, dfrLine.MeasurementPoint));
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Builds the canonical bus map: for each station and voltage that has exactly one bus-voltage
+    /// measurement point, the bus is named after that point so connected lines reference the
+    /// measured bus. Stations/voltages with multiple bus points keep the notional bus name.
+    /// </summary>
+    private static Dictionary<string, string> BuildCanonicalBusMap(List<(string Station, int KV, string MeasurementPoint)> busMeasurementPoints)
+    {
+        Dictionary<string, HashSet<string>> byStationVoltage = new(StringComparer.OrdinalIgnoreCase);
+
+        foreach ((string station, int kv, string mp) in busMeasurementPoints)
+        {
+            string key = $"{station}|{kv}";
+
+            if (!byStationVoltage.TryGetValue(key, out HashSet<string>? set))
+            {
+                set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                byStationVoltage[key] = set;
+            }
+
+            set.Add(mp);
+        }
+
+        Dictionary<string, string> canonical = new(StringComparer.OrdinalIgnoreCase);
+
+        foreach ((string key, HashSet<string> mps) in byStationVoltage)
+        {
+            if (mps.Count == 1)
+                canonical[key] = mps.First();
+        }
+
+        return canonical;
+    }
+
+    /// <summary>
+    /// Ensures a bus row exists for every bus-voltage measurement point, named after the point
+    /// (SEL guidance: a bus measurement point must have a matching bus identifier). The single
+    /// point per station/voltage is already created by line derivation via the canonical map;
+    /// this adds the remaining points (where several buses exist at one station/voltage).
+    /// </summary>
+    private static void AddBusMeasurementPointRows(
+        List<(string Station, int KV, string MeasurementPoint)> busMeasurementPoints,
+        Dictionary<string, StationRow> idStationMap,
+        Dictionary<string, BusRow> idBusMap,
+        List<BusRow> buses)
+    {
+        foreach ((string station, int kv, string mp) in busMeasurementPoints)
+        {
+            if (!idStationMap.ContainsKey(station) || idBusMap.ContainsKey(mp))
+                continue;
+
+            BusRow bus = new()
+            {
+                BusID = mp,
+                StationID = station,
+                NominalVoltageKV = kv
+            };
+
+            idBusMap[mp] = bus;
+            buses.Add(bus);
+        }
+    }
+
+    /// <summary>
+    /// A transformer winding terminal collected during transformer line derivation.
+    /// </summary>
+    private sealed record TransformerTerminal(
+        string DeviceAcronym,
+        string Station,
+        string Key,
+        string Side,
+        int NominalKV,
+        string MeasurementPoint,
+        string BusOverride);
+
+    /// <summary>
+    /// Derives transformer lines. A transformer is modeled as a line between two bus voltage
+    /// levels at the same substation. High-side and low-side terminals measured by the same
+    /// device with distinct voltages are paired into one two-terminal transformer line; any other
+    /// transformer terminal is anchored as a single-ended line.
+    /// </summary>
+    /// <returns>The number of transformer lines added.</returns>
+    private static int DeriveTransformerLines(
+        List<DeviceRecord> devices,
+        Dictionary<string, StationRow> idStationMap,
+        Dictionary<string, BusRow> idBusMap,
+        List<BusRow> buses,
+        Dictionary<string, List<DFRLineInfo>> deviceDFRLinesMap,
+        Dictionary<string, string> terminalMPs,
+        Dictionary<int, PhasorRecord> idPhasorMap,
+        Dictionary<string, string> canonicalBus,
+        HashSet<string> usedMeasurementPoints,
+        List<LineRow> lines,
+        HashSet<string> usedLineIDs,
+        HashSet<string> candidateTerminalMPs,
+        Dictionary<string, Dictionary<string, (int Kv, string PairedBusMP)>> lineVoltagePairing)
+    {
+        Dictionary<string, Dictionary<string, int>> deviceLabelVoltages = BuildDeviceLabelVoltages(devices, idPhasorMap);
+
+        // Collect transformer terminals (one per transformer winding), de-duplicated by point.
+        List<TransformerTerminal> terminals = [];
+        HashSet<string> seen = new(usedMeasurementPoints, StringComparer.OrdinalIgnoreCase);
+
+        foreach (DeviceRecord device in devices)
+        {
+            string? station = FindStationForDevice(device, idStationMap);
+
+            if (station is null || !deviceDFRLinesMap.TryGetValue(device.Acronym, out List<DFRLineInfo>? dfrLines))
+                continue;
+
+            foreach (DFRLineInfo dfrLine in dfrLines)
+            {
+                if (!IsTransformerLabel(dfrLine.LineName))
+                    continue;
+
+                string mp = string.IsNullOrWhiteSpace(dfrLine.MeasurementPoint)
+                    ? terminalMPs.GetValueOrDefault(device.Acronym) ?? string.Empty
+                    : dfrLine.MeasurementPoint;
+
+                if (string.IsNullOrWhiteSpace(mp) || !seen.Add(mp))
+                    continue;
+
+                int kv = ResolveLabelVoltage(device, dfrLine, deviceLabelVoltages, idPhasorMap);
+
+                if (kv <= 0)
+                    continue;
+
+                string busOverride = string.Empty;
+
+                if (lineVoltagePairing.TryGetValue(device.Acronym, out Dictionary<string, (int Kv, string PairedBusMP)>? deviceLineInfo) &&
+                    deviceLineInfo.TryGetValue(NormalizeToID(dfrLine.LineName), out (int Kv, string PairedBusMP) lineInfo))
+                    busOverride = lineInfo.PairedBusMP;
+
+                candidateTerminalMPs.Add(mp);
+                terminals.Add(new TransformerTerminal(device.Acronym, station, TransformerKey(dfrLine.LineName), TransformerSide(dfrLine.LineName), kv, mp, busOverride));
+            }
+        }
+
+        // Group by the same device and transformer identity so windings of one transformer pair up.
+        Dictionary<string, List<TransformerTerminal>> groups = new(StringComparer.OrdinalIgnoreCase);
+
+        foreach (TransformerTerminal terminal in terminals)
+        {
+            string key = $"{terminal.DeviceAcronym}|{terminal.Key}";
+
+            if (!groups.TryGetValue(key, out List<TransformerTerminal>? list))
+            {
+                list = [];
+                groups[key] = list;
+            }
+
+            list.Add(terminal);
+        }
+
+        int added = 0;
+
+        foreach ((string _, List<TransformerTerminal> group) in groups)
+        {
+            TransformerTerminal? high = group.Where(terminal => terminal.Side == "HS").OrderByDescending(terminal => terminal.NominalKV).FirstOrDefault();
+            TransformerTerminal? low = group.Where(terminal => terminal.Side == "LS").OrderBy(terminal => terminal.NominalKV).FirstOrDefault();
+
+            List<TransformerTerminal> remaining = group;
+
+            // A clean two-voltage transformer: pair the high and low windings into one line
+            // between the two bus voltage levels at the substation.
+            if (high is not null && low is not null && high.NominalKV != low.NominalKV)
+            {
+                lines.Add(new LineRow(
+                    LineID: MakeUniqueLineID($"{high.Station}_{high.Key}_XFMR", usedLineIDs),
+                    FromTerminalMP: high.MeasurementPoint,
+                    ToTerminalMP: low.MeasurementPoint,
+                    FromBusID: ResolveTerminalBus(high.BusOverride, high.Station, high.NominalKV, idStationMap, idBusMap, buses, canonicalBus),
+                    ToBusID: ResolveTerminalBus(low.BusOverride, low.Station, low.NominalKV, idStationMap, idBusMap, buses, canonicalBus),
+                    NominalVoltageKV: high.NominalKV));
+
+                usedMeasurementPoints.Add(high.MeasurementPoint);
+                usedMeasurementPoints.Add(low.MeasurementPoint);
+                added++;
+
+                remaining = group.Where(terminal => terminal != high && terminal != low).ToList();
+            }
+
+            // Any remaining transformer terminal is anchored on its own (single-ended) line.
+            foreach (TransformerTerminal terminal in remaining)
+            {
+                string sideSuffix = terminal.Side.Length > 0 ? $"_{terminal.Side}" : string.Empty;
+
+                lines.Add(new LineRow(
+                    LineID: MakeUniqueLineID($"{terminal.Station}_{terminal.Key}{sideSuffix}", usedLineIDs),
+                    FromTerminalMP: terminal.MeasurementPoint,
+                    ToTerminalMP: string.Empty,
+                    FromBusID: ResolveTerminalBus(terminal.BusOverride, terminal.Station, terminal.NominalKV, idStationMap, idBusMap, buses, canonicalBus),
+                    ToBusID: string.Empty,
+                    NominalVoltageKV: terminal.NominalKV));
+
+                usedMeasurementPoints.Add(terminal.MeasurementPoint);
+                added++;
+            }
+        }
+
+        return added;
+    }
+
+    /// <summary>
+    /// Resolves a remote endpoint name to a known station only on a confident match (exact, or
+    /// equal after removing underscores and case). Loose substring matching is intentionally
+    /// avoided here so that an asset name (such as a generator or unit) is not mistaken for a
+    /// remote station, which would create a line whose two ends share a substation.
+    /// </summary>
+    private static string? FindKnownStation(string remoteID, Dictionary<string, StationRow> idStationMap)
+    {
+        if (string.IsNullOrWhiteSpace(remoteID))
+            return null;
+
+        if (idStationMap.ContainsKey(remoteID))
+            return remoteID;
+
+        string normalizedRemote = remoteID.Replace("_", string.Empty).ToUpperInvariant();
+
+        foreach (string stationID in idStationMap.Keys)
+        {
+            if (stationID.Replace("_", string.Empty).ToUpperInvariant() == normalizedRemote)
+                return stationID;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Returns the base line identifier if unused, otherwise appends a numeric suffix to keep
+    /// every line identifier unique (line identifiers are also their display names).
+    /// </summary>
+    private static string MakeUniqueLineID(string baseID, HashSet<string> usedLineIDs)
+    {
+        if (usedLineIDs.Add(baseID))
+            return baseID;
+
+        for (int n = 2; ; n++)
+        {
+            string candidate = $"{baseID}_{n}";
+
+            if (usedLineIDs.Add(candidate))
+                return candidate;
+        }
+    }
+
+    /// <summary>
+    /// Sets each station's nominal voltage to the maximum voltage among its buses, per the
+    /// power system model rule that a station's nominal voltage is the highest of its buses.
+    /// Accounts for buses generated on demand during line derivation.
+    /// </summary>
+    /// <param name="stations">The station records to reconcile.</param>
+    /// <param name="buses">The bus records (including any generated on demand).</param>
+    private static void ReconcileStationVoltages(List<StationRow> stations, List<BusRow> buses)
+    {
+        Dictionary<string, int> maxByStation = new(StringComparer.OrdinalIgnoreCase);
+
+        foreach (BusRow bus in buses)
+        {
+            if (bus.NominalVoltageKV > maxByStation.GetValueOrDefault(bus.StationID))
+                maxByStation[bus.StationID] = bus.NominalVoltageKV;
+        }
+
+        foreach (StationRow station in stations)
+        {
+            if (maxByStation.TryGetValue(station.StationID, out int maxKV) && maxKV > station.NominalVoltageKV)
+                station.NominalVoltageKV = maxKV;
+        }
+    }
+
+    /// <summary>
+    /// A measurement point's representative description and which quantity families it carries.
+    /// </summary>
+    private sealed record MeasurementPointInfo(string Description, bool HasVoltage, bool HasCurrent);
+
+    /// <summary>
+    /// Loads every distinct measurement point from the signal mappings CSV with a representative
+    /// description and whether it carries voltage and/or current quantities. Used to report and
+    /// classify measurement points that are not associated with the model.
+    /// </summary>
+    /// <returns>A dictionary mapping each measurement point to its description and quantity content.</returns>
+    private static Dictionary<string, MeasurementPointInfo> LoadAllMeasurementPoints()
+    {
+        Dictionary<string, string> descriptions = new(StringComparer.OrdinalIgnoreCase);
+        HashSet<string> hasVoltage = new(StringComparer.OrdinalIgnoreCase);
+        HashSet<string> hasCurrent = new(StringComparer.OrdinalIgnoreCase);
+
+        string csvPath = Settings.SttpSelConfigCsvPath;
+
+        if (!string.IsNullOrWhiteSpace(csvPath) && File.Exists(csvPath))
+        {
+            foreach (string rawLine in File.ReadLines(csvPath).Skip(1))
+            {
+                string line = rawLine.Trim();
+
+                if (line.Length == 0)
+                    continue;
+
+                string[] fields = ParseCSVLine(line);
+
+                if (fields.Length < 4)
+                    continue;
+
+                string mp = fields[2].Trim();
+
+                if (mp.Length == 0)
+                    continue;
+
+                if (!descriptions.ContainsKey(mp))
+                    descriptions[mp] = fields[1].Trim();
+
+                string quantity = fields[3];
+
+                if (quantity.Contains("Voltage", StringComparison.OrdinalIgnoreCase))
+                    hasVoltage.Add(mp);
+                else if (quantity.Contains("Current", StringComparison.OrdinalIgnoreCase))
+                    hasCurrent.Add(mp);
+            }
+        }
+
+        Dictionary<string, MeasurementPointInfo> result = new(StringComparer.OrdinalIgnoreCase);
+
+        foreach ((string mp, string description) in descriptions)
+            result[mp] = new MeasurementPointInfo(description, hasVoltage.Contains(mp), hasCurrent.Contains(mp));
+
+        return result;
+    }
+
+    /// <summary>
+    /// Classifies measurement points anchored to neither a line terminal nor a bus. Distinguishes
+    /// "redundant duplicates" — points that were a real terminal candidate but lost to another
+    /// point at the same, already-modeled terminal (correct to omit) — from "genuine gaps":
+    /// complete (voltage + current) terminals that were never modelable, which usually signals a
+    /// source-data issue such as a device with no resolvable voltage.
+    /// </summary>
+    /// <param name="allMeasurementPoints">All measurement points with description and quantity content.</param>
+    /// <param name="anchoredMeasurementPoints">Points used as a line terminal or present as a bus identifier.</param>
+    /// <param name="candidateTerminalMPs">Points considered as a line/transformer terminal (emitted or dropped).</param>
+    /// <returns>The unanchored count, a category summary, and the explicit list of genuine V+I gaps.</returns>
+    private static (int Count, string Summary, List<string> GenuineGaps) AnalyzeOrphanMeasurementPoints(
+        Dictionary<string, MeasurementPointInfo> allMeasurementPoints,
+        HashSet<string> anchoredMeasurementPoints,
+        HashSet<string> candidateTerminalMPs)
+    {
+        int redundant = 0, genuineVI = 0, currentOnly = 0, voltageOnly = 0, other = 0, count = 0;
+        List<string> genuineGaps = [];
+
+        foreach ((string mp, MeasurementPointInfo info) in allMeasurementPoints)
+        {
+            if (anchoredMeasurementPoints.Contains(mp))
+                continue;
+
+            count++;
+
+            if (candidateTerminalMPs.Contains(mp))
+            {
+                // Was a real terminal candidate; its terminal is already represented by another point.
+                redundant++;
+            }
+            else if (info.HasVoltage && info.HasCurrent)
+            {
+                // A complete terminal that was never modelable — the actionable gap.
+                genuineVI++;
+                genuineGaps.Add($"{mp} (V+I) — {info.Description}");
+            }
+            else if (info.HasCurrent)
+            {
+                currentOnly++;
+            }
+            else if (info.HasVoltage)
+            {
+                voltageOnly++;
+            }
+            else
+            {
+                other++;
+            }
+        }
+
+        string summary = $"redundant duplicates={redundant}, genuine gaps (V+I, unmodeled)={genuineVI}, " +
+                         $"current-only={currentOnly}, voltage-only={voltageOnly}, other={other}";
+
+        return (count, summary, genuineGaps);
+    }
+
+    /// <summary>
+    /// Removes notional buses (those not named after a measured bus-voltage point) that no line
+    /// references, provided their station retains at least one bus. These appear when a station has
+    /// several measured buses at one voltage: the per-voltage notional bus is created but every line
+    /// references a specific measured bus instead, leaving the notional bus empty and unused.
+    /// </summary>
+    private static void PruneUnreferencedNotionalBuses(
+        List<BusRow> buses,
+        Dictionary<string, BusRow> idBusMap,
+        List<LineRow> lines,
+        HashSet<string> busMeasurementPointNames)
+    {
+        HashSet<string> referenced = new(StringComparer.OrdinalIgnoreCase);
+
+        foreach (LineRow line in lines)
+        {
+            if (!string.IsNullOrWhiteSpace(line.FromBusID))
+                referenced.Add(line.FromBusID);
+
+            if (!string.IsNullOrWhiteSpace(line.ToBusID))
+                referenced.Add(line.ToBusID);
+        }
+
+        HashSet<string> stationsWithKeeper = new(StringComparer.OrdinalIgnoreCase);
+
+        foreach (BusRow bus in buses)
+        {
+            if (referenced.Contains(bus.BusID) || busMeasurementPointNames.Contains(bus.BusID))
+                stationsWithKeeper.Add(bus.StationID);
+        }
+
+        buses.RemoveAll(bus =>
+        {
+            bool prune = !busMeasurementPointNames.Contains(bus.BusID) &&
+                         !referenced.Contains(bus.BusID) &&
+                         stationsWithKeeper.Contains(bus.StationID);
+
+            if (prune)
+                idBusMap.Remove(bus.BusID);
+
+            return prune;
+        });
+    }
+
+    /// <summary>
+    /// Identifies line terminals that cannot yield a power calculation because their current has no
+    /// usable voltage source — the terminal measurement point carries no voltage of its own and its
+    /// bus is notional (carries no measured voltage). Reports them so power-calc coverage is visible.
+    /// </summary>
+    private static List<string> AnalyzePowerCalcCoverage(
+        List<LineRow> lines,
+        Dictionary<string, MeasurementPointInfo> allMeasurementPoints,
+        HashSet<string> busMeasurementPointNames)
+    {
+        List<string> gaps = [];
+
+        void CheckSide(string lineID, string side, string mp, string busID)
+        {
+            if (string.IsNullOrWhiteSpace(mp))
+                return;
+
+            bool mpHasOwnVoltage = allMeasurementPoints.TryGetValue(mp, out MeasurementPointInfo? info) && info.HasVoltage;
+            bool busHasVoltage = !string.IsNullOrWhiteSpace(busID) && busMeasurementPointNames.Contains(busID);
+
+            if (!mpHasOwnVoltage && !busHasVoltage)
+                gaps.Add($"{lineID} [{side}]: {mp} current has no voltage source (bus {(string.IsNullOrWhiteSpace(busID) ? "<none>" : busID)})");
+        }
+
+        foreach (LineRow line in lines)
+        {
+            CheckSide(line.LineID, "From", line.FromTerminalMP, line.FromBusID);
+            CheckSide(line.LineID, "To", line.ToTerminalMP, line.ToBusID);
+        }
+
+        return gaps;
+    }
+
+    /// <summary>
+    /// Validates the derived model against the SEL power system model rules and returns a list
+    /// of human-readable violation messages (empty when the model is consistent): a terminal
+    /// measurement point must have a same-side bus; a line's two ends must be different buses at
+    /// different stations; each measurement point appears at most once; bus identifiers and
+    /// measurement points stay disjoint; every station has a bus and every bus has a station.
+    /// </summary>
+    /// <param name="stations">The station records.</param>
+    /// <param name="buses">The bus records.</param>
+    /// <param name="lines">The line records.</param>
+    /// <returns>A list of violation messages, empty when the model is consistent.</returns>
+    private static List<string> CheckModelInvariants(List<StationRow> stations, List<BusRow> buses, List<LineRow> lines)
+    {
+        List<string> violations = [];
+
+        HashSet<string> stationIDs = new(stations.Select(station => station.StationID), StringComparer.OrdinalIgnoreCase);
+        HashSet<string> busIDs = new(buses.Select(bus => bus.BusID), StringComparer.OrdinalIgnoreCase);
+        HashSet<string> stationsWithBus = new(buses.Select(bus => bus.StationID), StringComparer.OrdinalIgnoreCase);
+
+        foreach (string stationID in stationIDs)
+        {
+            if (!stationsWithBus.Contains(stationID))
+                violations.Add($"station has no bus: {stationID}");
+        }
+
+        foreach (BusRow bus in buses)
+        {
+            if (!stationIDs.Contains(bus.StationID))
+                violations.Add($"bus references missing station: {bus.BusID}");
+        }
+
+        Dictionary<string, int> mpUses = new(StringComparer.OrdinalIgnoreCase);
+
+        foreach (LineRow line in lines)
+        {
+            bool hasFromBus = !string.IsNullOrWhiteSpace(line.FromBusID);
+            bool hasToBus = !string.IsNullOrWhiteSpace(line.ToBusID);
+
+            if (hasFromBus && hasToBus && line.FromBusID.Equals(line.ToBusID, StringComparison.OrdinalIgnoreCase))
+                violations.Add($"line from-bus equals to-bus: {line.LineID}");
+
+            // Note: a line whose two buses are at the same substation but different voltages is a
+            // valid transformer; only identical From/To buses (above) are rejected.
+
+            if (!string.IsNullOrWhiteSpace(line.FromTerminalMP) && !hasFromBus)
+                violations.Add($"from measurement point without a bus: {line.LineID}");
+
+            if (!string.IsNullOrWhiteSpace(line.ToTerminalMP) && !hasToBus)
+                violations.Add($"to measurement point without a bus: {line.LineID}");
+
+            foreach (string busID in new[] { line.FromBusID, line.ToBusID })
+            {
+                if (!string.IsNullOrWhiteSpace(busID) && !busIDs.Contains(busID))
+                    violations.Add($"line references missing bus {busID}: {line.LineID}");
+            }
+
+            foreach (string mp in new[] { line.FromTerminalMP, line.ToTerminalMP })
+            {
+                if (string.IsNullOrWhiteSpace(mp))
+                    continue;
+
+                mpUses[mp] = mpUses.GetValueOrDefault(mp) + 1;
+
+                if (busIDs.Contains(mp))
+                    violations.Add($"measurement point equals a bus id: {mp}");
+            }
+        }
+
+        foreach ((string mp, int uses) in mpUses)
+        {
+            if (uses > 1)
+                violations.Add($"measurement point used {uses} times: {mp}");
+        }
+
+        return violations;
     }
 
     // ========= Adjacent bus computation =========
@@ -1339,51 +2327,6 @@ public static class PowerSystemModelExporter
         foreach ((string stationID, StationRow station) in idStationMap)
         {
             if (CoordinateKey(station.Latitude, station.Longitude) == coordinateKey)
-                return stationID;
-        }
-
-        return null;
-    }
-
-    /// <summary>
-    /// Attempts to match a remote station identifier to a known station.
-    /// Uses fuzzy matching to handle name variations (e.g., "BAXTER WILSON" in device
-    /// Name matching station "BAXTER_WILSON").
-    /// </summary>
-    /// <param name="remoteID">The remote station identifier to match.</param>
-    /// <param name="idStationMap">A dictionary mapping station IDs to station records.</param>
-    /// <returns>The matched station ID if found; otherwise, <c>null</c>.</returns>
-    /// <remarks>
-    /// <para>
-    /// Matching is attempted in the following order:
-    /// 1. Exact match on station ID
-    /// 2. Normalized match (ignoring underscores, spaces, and case)
-    /// 3. Partial match (one name contains the other)
-    /// </para>
-    /// </remarks>
-    private static string? FindMatchingStation(string remoteID, Dictionary<string, StationRow> idStationMap)
-    {
-        if (string.IsNullOrWhiteSpace(remoteID))
-            return null;
-
-        // Exact match
-        if (idStationMap.ContainsKey(remoteID))
-            return remoteID;
-
-        // Try partial matching: check if any known station ID matches when normalized
-        string normalizedRemote = remoteID.Replace("_", string.Empty).Replace(" ", string.Empty).ToUpperInvariant();
-
-        foreach (string stationID in idStationMap.Keys)
-        {
-            string normalizedStation = stationID.Replace("_", string.Empty).Replace(" ", string.Empty).ToUpperInvariant();
-
-            if (normalizedStation == normalizedRemote)
-                return stationID;
-
-            // Check if station contains remote or remote contains station
-            // (handles partial matches like "MABELVALE" matching "MABELVALE_SES")
-            if (normalizedStation.Contains(normalizedRemote, StringComparison.OrdinalIgnoreCase) ||
-                normalizedRemote.Contains(normalizedStation, StringComparison.OrdinalIgnoreCase))
                 return stationID;
         }
 

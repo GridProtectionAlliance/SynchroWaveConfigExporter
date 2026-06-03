@@ -170,10 +170,83 @@ internal class Program
             Console.WriteLine($"  DFR devices found: {modelResult.DFRDevicesFound:N0}");
             Console.WriteLine($"  Line terminal, PMU devices found: {modelResult.LineTerminalDevicesFound:N0}");
             Console.WriteLine($"  Stations skipped (no name): {modelResult.StationsSkippedNoName:N0}");
+
+            foreach (string detail in modelResult.SkippedNoNameDetails.Take(20))
+                Console.WriteLine($"    - {detail}");
+
             Console.WriteLine($"  Stations skipped (no voltage): {modelResult.StationsSkippedNoVoltage:N0}");
+
+            foreach (string detail in modelResult.SkippedNoVoltageDetails.Take(20))
+                Console.WriteLine($"    - {detail}");
+
             Console.WriteLine($"  Stations exported: {modelResult.StationsExported:N0}");
             Console.WriteLine($"  Buses exported: {modelResult.BusesExported:N0}");
             Console.WriteLine($"  Lines exported: {modelResult.LinesExported:N0}");
+            Console.WriteLine($"  Unanchored measurement points: {modelResult.OrphanMeasurementPoints:N0} ({modelResult.OrphanMeasurementPointSummary})");
+
+            if (modelResult.OrphanGenuineGaps.Count > 0)
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"    Genuine gaps (complete V+I terminals with no model anchor) — likely missing source voltage:");
+
+                foreach (string gap in modelResult.OrphanGenuineGaps.Take(20))
+                    Console.WriteLine($"      - {gap}");
+
+                if (modelResult.OrphanGenuineGaps.Count > 20)
+                    Console.WriteLine($"      ... and {modelResult.OrphanGenuineGaps.Count - 20:N0} more");
+
+                Console.ResetColor();
+            }
+
+            if (modelResult.InvariantViolations.Count == 0)
+            {
+                Console.WriteLine("  Model rule check: PASS (no violations)");
+            }
+            else
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"  Model rule check: {modelResult.InvariantViolations.Count:N0} violation(s):");
+
+                foreach (string violation in modelResult.InvariantViolations.Take(20))
+                    Console.WriteLine($"    - {violation}");
+
+                if (modelResult.InvariantViolations.Count > 20)
+                    Console.WriteLine($"    ... and {modelResult.InvariantViolations.Count - 20:N0} more");
+
+                Console.ResetColor();
+            }
+
+            if (modelResult.PowerCalcGaps.Count == 0)
+            {
+                Console.WriteLine("  Power-calc coverage: every line terminal has a voltage source");
+            }
+            else
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"  Power-calc coverage: {modelResult.PowerCalcGaps.Count:N0} line terminal(s) with no voltage source:");
+
+                foreach (string gap in modelResult.PowerCalcGaps.Take(20))
+                    Console.WriteLine($"    - {gap}");
+
+                if (modelResult.PowerCalcGaps.Count > 20)
+                    Console.WriteLine($"    ... and {modelResult.PowerCalcGaps.Count - 20:N0} more");
+
+                Console.ResetColor();
+            }
+
+            if (modelResult.PossibleTypos.Count > 0)
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"  Possible source-data spelling typos: {modelResult.PossibleTypos.Count:N0} (review; identifiers are not merged automatically):");
+
+                foreach (string typo in modelResult.PossibleTypos.Take(20))
+                    Console.WriteLine($"    - {typo}");
+
+                if (modelResult.PossibleTypos.Count > 20)
+                    Console.WriteLine($"    ... and {modelResult.PossibleTypos.Count - 20:N0} more");
+
+                Console.ResetColor();
+            }
 
             if (modelResult.SampleDeviceAcronyms.Count > 0)
             {
