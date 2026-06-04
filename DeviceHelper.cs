@@ -1,7 +1,7 @@
 //******************************************************************************************************
 //  DeviceHelper.cs - Gbtc
 //
-//  Copyright © 2026, Grid Protection Alliance.  All Rights Reserved.
+//  Copyright Â© 2026, Grid Protection Alliance.  All Rights Reserved.
 //
 //  Licensed to the Grid Protection Alliance (GPA) under one or more contributor license agreements. See
 //  the NOTICE file distributed with this work for additional information regarding copyright ownership.
@@ -106,7 +106,7 @@ public static class DeviceHelper
 
     /// <summary>
     /// Checks if a device is a DFR (Digital Fault Recorder) device.
-    /// DFR devices have _D_ in the acronym (e.g.: GRAND_GULF_1_D_EPN8).
+    /// DFR devices have _D_ in the acronym (e.g.: MAPLE_RIDGE_1_D_EPN8).
     /// </summary>
     /// <param name="device">The device acronym to check.</param>
     /// <returns><c>true</c> if the device contains "_D_"; otherwise, <c>false</c>.</returns>
@@ -160,11 +160,64 @@ public static class DeviceHelper
         return false;
     }
 
+    /// <summary>
+    /// Determines whether the specified token represents a system prefix.
+    /// </summary>
+    /// <param name="token">The token to evaluate.</param>
+    /// <returns>
+    /// <c>true</c> if the token is a recognized system prefix (e.g., "PMU", "PDC", "SUB", or "SITE");
+    /// otherwise, <c>false</c>.
+    /// </returns>
+    public static bool IsSystemPrefix(string token)
+    {
+        token = token.Trim().ToUpperInvariant();
+        return token is "PMU" or "PDC" or "SUB" or "SITE";
+    }
+
+    /// <summary>
+    /// Determines whether the specified token represents a unit identifier.
+    /// </summary>
+    /// <param name="token">The token to evaluate.</param>
+    /// <returns>
+    /// <c>true</c> if the token is a valid unit identifier (a non-negative integer between 0 and 99); otherwise, <c>false</c>.
+    /// </returns>
+    public static bool IsUnitToken(string token)
+    {
+        if (!int.TryParse(token, NumberStyles.None, CultureInfo.InvariantCulture, out int n))
+            return false;
+
+        return n is >= 0 and <= 99;
+    }
+
+    /// <summary>
+    /// Determines whether the specified token is a valid name token.
+    /// </summary>
+    /// <param name="token">The token to evaluate.</param>
+    /// <returns>
+    /// <c>true</c> if the token is a valid name token; otherwise, <c>false</c>.
+    /// A valid name token is at least three characters long and consists only of alphabetic characters.
+    /// </returns>
+    public static bool IsNameToken(string token)
+    {
+        token = token.Trim();
+
+        if (token.Length < 3)
+            return false;
+
+        foreach (char c in token)
+        {
+            if (c is (< 'A' or > 'Z') and (< 'a' or > 'z'))
+                return false;
+        }
+
+        return true;
+    }
+
     // ========= Station Name Extraction =========
 
     /// <summary>
     /// Extracts the PMU base name (station name) from a device acronym by removing the _P_XXX# suffix.
-    /// e.g.: "GOSLIN_ALDEN_P_NNN4" -> "GOSLIN_ALDEN"
+    /// e.g.: "MORGAN_TATE_P_NNN4" -> "MORGAN_TATE"
     /// </summary>
     /// <param name="device">The device acronym to parse.</param>
     /// <returns>The station name portion before "_P_", or <c>null</c> if the pattern is not found.</returns>
@@ -182,7 +235,7 @@ public static class DeviceHelper
     }
 
     /// <summary>
-    /// Extracts station name from DFR device acronym: "GRAND_GULF_1_D_EPN8" => "GRAND GULF".
+    /// Extracts station name from DFR device acronym: "MAPLE_RIDGE_1_D_EPN8" => "MAPLE RIDGE".
     /// Walks tokens right-to-left from the "_D_" marker, skipping the unit number.
     /// </summary>
     /// <param name="acronym">The DFR device acronym to parse.</param>
@@ -293,7 +346,7 @@ public static class DeviceHelper
 
     /// <summary>
     /// Extracts the canonical line name from a phasor label or description, normalizing variations.
-    /// e.g.: "BOGALUSA_LN_A" and "BOGALUSA_LN_B" both map to base "BOGALUSA_LN" with suffix "A"/"B"
+    /// e.g.: "OAKDALE_LN_A" and "OAKDALE_LN_B" both map to base "OAKDALE_LN" with suffix "A"/"B"
     /// Phase suffixes like _IA, _VA are stripped since they indicate phase, not line.
     /// </summary>
     /// <param name="phasorLabel">The phasor label (e.g., from PhasorLabel field).</param>
@@ -324,9 +377,9 @@ public static class DeviceHelper
 
     /// <summary>
     /// Extracts a line/phasor name from the description field.
-    /// e.g.: "ADAMS_CREEK_1_D_EPN8 WPEC A Current Magnitude" => "WPEC"
-    /// e.g.: "ADAMS_CREEK_1_D_EPN8-MW_A-WPEC Active Power Calculation" => "WPEC"
-    /// e.g.: "RAY_BRASWELL_2_D_EPN6 EAST_BUS A Voltage Magnitude" => "EAST_BUS"
+    /// e.g.: "WILLOW_CREEK_1_D_EPN8 WCEC A Current Magnitude" => "WCEC"
+    /// e.g.: "WILLOW_CREEK_1_D_EPN8-MW_A-WCEC Active Power Calculation" => "WCEC"
+    /// e.g.: "LELAND_PARK_2_D_EPN6 EAST_BUS A Voltage Magnitude" => "EAST_BUS"
     /// </summary>
     /// <param name="desc">The measurement description to parse.</param>
     /// <returns>The extracted line name, or <c>null</c> if no valid line name is found.</returns>
@@ -387,7 +440,7 @@ public static class DeviceHelper
         }
 
         // Pattern 3: "DEVICE LINENAME X Signal Type" (standard phasor descriptions)
-        // e.g.: "RAY_BRASWELL_2_D_EPN6 EAST_BUS A Voltage Magnitude" => "EAST_BUS"
+        // e.g.: "LELAND_PARK_2_D_EPN6 EAST_BUS A Voltage Magnitude" => "EAST_BUS"
         // Find the first space after the device acronym, then the line name follows
         index = desc.IndexOf(' ');
 
@@ -420,8 +473,8 @@ public static class DeviceHelper
     /// <summary>
     /// Strips phase suffixes from phasor labels.
     /// e.g.: "AUTOTRAN_1____IA" -> "AUTOTRAN_1", "115kV_BUS_____VC" -> "115kV_BUS"
-    /// e.g.: "BOGALUSA_LN_A" -> "BOGALUSA_LN_A" (not a phase suffix - no I or V before the letter)
-    /// e.g.: "230_NORREL_LN_IB" -> "230_NORREL_LN"
+    /// e.g.: "OAKDALE_LN_A" -> "OAKDALE_LN_A" (not a phase suffix - no I or V before the letter)
+    /// e.g.: "230_KENDALL_LN_IB" -> "230_KENDALL_LN"
     /// </summary>
     /// <param name="label">The phasor label to process.</param>
     /// <returns>The label with phase suffixes removed.</returns>
@@ -466,6 +519,19 @@ public static class DeviceHelper
     }
 
     /// <summary>
+    /// Removes a leading voltage prefix from a normalized label, e.g. "230_EAST_BUS" -&gt; "EAST_BUS"
+    /// or "115KV_N_BUS" -&gt; "N_BUS", so bus labels that carry a voltage prefix in one source but not
+    /// another still match.
+    /// </summary>
+    /// <param name="label">The label to strip.</param>
+    /// <returns>The label without any leading voltage-level prefix.</returns>
+    public static string StripVoltagePrefix(string label)
+    {
+        Match match = Regex.Match(label, @"^\d+(KV)?_(.+)$", RegexOptions.IgnoreCase);
+        return match.Success ? match.Groups[2].Value : label;
+    }
+
+    /// <summary>
     /// Checks if a token is a phase or signal type indicator that shouldn't be used as line name.
     /// </summary>
     /// <param name="token">The token to check.</param>
@@ -478,6 +544,85 @@ public static class DeviceHelper
             "FREQUENCY" or "CALCULATED" or "VALUE" or "CALCULATION" or 
             "ACTIVE" or "REACTIVE" or "APPARENT" or "POWER" or "3-PHASE" or 
             "THREEPHASE" or "THREE" or "MW" or "MVA" or "MVAR";
+    }
+
+    /// <summary>
+    /// Determines whether a measurement description denotes a calculated value (power, 3-phase, etc.)
+    /// rather than a raw phasor measurement.
+    /// </summary>
+    /// <param name="description">The measurement description to evaluate.</param>
+    /// <returns><c>true</c> if the description indicates a calculated value; otherwise, <c>false</c>.</returns>
+    public static bool IsCalculatedValue(string? description)
+    {
+        string desc = description ?? string.Empty;
+
+        return desc.Contains("-MW_", StringComparison.OrdinalIgnoreCase) ||
+               desc.Contains("Calculated Value:", StringComparison.OrdinalIgnoreCase) ||
+               desc.Contains("Power Calculation", StringComparison.OrdinalIgnoreCase) ||
+               desc.Contains("3-Phase", StringComparison.OrdinalIgnoreCase);
+    }
+
+    // ========= Bus & Transformer Identification =========
+
+    /// <summary>Determines whether a phasor label/line name denotes a bus (a voltage node).</summary>
+    /// <param name="name">The phasor label or line name to evaluate.</param>
+    /// <returns><c>true</c> if the name denotes a bus; otherwise, <c>false</c>.</returns>
+    public static bool IsBusLabel(string? name)
+    {
+        return !string.IsNullOrWhiteSpace(name) && name.Contains("BUS", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Determines whether a phasor label/line name denotes a transformer terminal: a high-side
+    /// (<c>_HS</c>) or low-side (<c>_LS</c>) marker, or an explicit transformer name (XFMR/AUTOTRAN).
+    /// </summary>
+    /// <param name="name">The phasor label or line name to evaluate.</param>
+    /// <returns><c>true</c> if the name denotes a transformer terminal; otherwise, <c>false</c>.</returns>
+    public static bool IsTransformerLabel(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return false;
+
+        string upper = name.Trim().ToUpperInvariant();
+
+        return upper.EndsWith("_HS", StringComparison.Ordinal) ||
+               upper.EndsWith("_LS", StringComparison.Ordinal) ||
+               upper.Contains("XFMR", StringComparison.Ordinal) ||
+               upper.Contains("AUTOTRAN", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Returns "HS", "LS", or empty string for a transformer terminal's winding side.
+    /// </summary>
+    /// <param name="name">The transformer terminal label.</param>
+    /// <returns>"HS" for a high-side winding, "LS" for a low-side winding, or an empty string.</returns>
+    public static string TransformerSide(string name)
+    {
+        string upper = name.Trim().ToUpperInvariant();
+
+        if (upper.EndsWith("_HS", StringComparison.Ordinal))
+            return "HS";
+
+        if (upper.EndsWith("_LS", StringComparison.Ordinal))
+            return "LS";
+
+        return string.Empty;
+    }
+
+    /// <summary>
+    /// Returns a transformer identity key from a terminal label by removing the winding-side
+    /// suffix, e.g. "AUTO_1_HS" and "AUTO_1_LS" both yield "AUTO_1".
+    /// </summary>
+    /// <param name="name">The transformer terminal label.</param>
+    /// <returns>The transformer identity key with any winding-side suffix removed.</returns>
+    public static string TransformerKey(string name)
+    {
+        string id = NormalizeToID(name);
+
+        if (id.EndsWith("_HS", StringComparison.Ordinal) || id.EndsWith("_LS", StringComparison.Ordinal))
+            id = id[..^3];
+
+        return id;
     }
 
     // ========= Line Parsing for Power System Model =========
@@ -497,7 +642,7 @@ public static class DeviceHelper
     /// Parses a line-terminal device to extract from-station, to-remote, and voltage.
     /// Uses the device Name field "STATION-REMOTE {KV}KV" as the primary source.
     /// </summary>
-    /// <param name="deviceName">The device Name field (e.g., "GRAND GULF-BAXTER WILSON 500KV").</param>
+    /// <param name="deviceName">The device Name field (e.g., "MAPLE RIDGE-CEDAR JUNCTION 500KV").</param>
     /// <param name="fallbackKV">Fallback voltage to use if not found in name (e.g., from phasor data). Default is 0.</param>
     /// <returns>A <see cref="LineParse"/> record containing the parsed line information, or <c>null</c> if parsing fails.</returns>
     /// <remarks>
@@ -539,7 +684,7 @@ public static class DeviceHelper
             return null;
 
         // Strip trailing descriptors like "L1", "L2", "T1 T2" from remote name
-        // (e.g., "CHURCHILL L1" => "CHURCHILL", "STARTUP T1 T2" => "STARTUP")
+        // (e.g., "WESTBROOK L1" => "WESTBROOK", "STARTUP T1 T2" => "STARTUP")
         remote = Regex.Replace(remote, @"\s+[LT]\d+(\s+[LT]\d+)*\s*$", string.Empty, RegexOptions.IgnoreCase).Trim();
 
         // Strip trailing unit number like "AUTO1" => "AUTO" if followed by digit
@@ -552,13 +697,13 @@ public static class DeviceHelper
 
     /// <summary>
     /// Normalizes a station or line name to a valid identifier.
-    /// "DAYTON BULK" => "DAYTON_BULK", "EL DORADO" => "EL_DORADO"
+    /// "FAIRMONT BULK" => "FAIRMONT_BULK", "GREEN VALLEY" => "GREEN_VALLEY"
     /// </summary>
     /// <param name="name">The name to normalize.</param>
     /// <returns>A normalized identifier with spaces replaced by underscores and only alphanumeric characters and underscores retained.</returns>
     public static string NormalizeToID(string name)
     {
-        // "DAYTON BULK" => "DAYTON_BULK", "EL DORADO" => "EL_DORADO"
+        // "FAIRMONT BULK" => "FAIRMONT_BULK", "GREEN VALLEY" => "GREEN_VALLEY"
         string id = name.Trim().Replace(' ', '_').ToUpperInvariant();
 
         // Strip any non-alphanumeric/underscore characters

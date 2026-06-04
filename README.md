@@ -315,6 +315,55 @@ public static LineParse? ParseLineFromDeviceName(string? deviceName,
 
 **Customize for:** How your utility encodes line endpoints and voltage in device names
 
+#### 5. Bus, Transformer & Calculated-Value Identification
+
+These helpers classify phasor labels and measurement descriptions by your utility's conventions:
+
+```csharp
+/// <summary>Determines whether a phasor label/line name denotes a bus (a voltage node).</summary>
+public static bool IsBusLabel(string? name)
+
+/// <summary>Determines whether a phasor label/line name denotes a transformer terminal.</summary>
+public static bool IsTransformerLabel(string? name)
+
+/// <summary>Returns "HS", "LS", or empty string for a transformer terminal's winding side.</summary>
+public static string TransformerSide(string name)
+
+/// <summary>Returns a transformer identity key by removing the winding-side suffix.</summary>
+public static string TransformerKey(string name)
+
+/// <summary>Removes a leading voltage prefix from a label (e.g., "230_EAST_BUS" -> "EAST_BUS").</summary>
+public static string StripVoltagePrefix(string label)
+
+/// <summary>Determines whether a measurement description denotes a calculated value.</summary>
+public static bool IsCalculatedValue(string? description)
+```
+
+**Default Patterns:**
+- Bus labels contain `BUS`
+- Transformer labels end with `_HS`/`_LS` or contain `XFMR`/`AUTOTRAN`
+- Voltage prefixes look like `230_` or `115KV_`
+- Calculated values contain `-MW_`, `Calculated Value:`, `Power Calculation`, or `3-Phase`
+
+**Customize for:** How your utility names buses, transformer windings, voltage prefixes, and calculated/derived measurements
+
+#### 6. Measurement Point Token Classification
+
+Used when compressing device/station names into 16-character `MeasurementPoint` identifiers:
+
+```csharp
+/// <summary>Determines whether a token is a system prefix (e.g., "PMU", "PDC", "SUB", "SITE").</summary>
+public static bool IsSystemPrefix(string token)
+
+/// <summary>Determines whether a token is a unit identifier (integer 0-99).</summary>
+public static bool IsUnitToken(string token)
+
+/// <summary>Determines whether a token is a valid name token (3+ alphabetic characters).</summary>
+public static bool IsNameToken(string token)
+```
+
+**Customize for:** Your utility's device-name token vocabulary and unit-numbering scheme
+
 ### Customization Workflow
 
 1. **Analyze Your Data:**

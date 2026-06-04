@@ -303,7 +303,7 @@ public static class SttpConfigExporter
 
         // Multiple phasor groups - could pick the first one, but that might be arbitrary
         // For now, if there are multiple, use the first one encountered
-        // This handles cases like DRIVER_SOLAR where there's effectively one line
+        // This handles cases like MESA_SOLAR where there's effectively one line
         if (mpList.Count > 0)
             return mpList[0];
 
@@ -315,17 +315,12 @@ public static class SttpConfigExporter
     /// </summary>
     private static bool IsCalculatedValue(MeasurementRow row)
     {
-        string desc = row.Description ?? string.Empty;
-
-        return desc.Contains("-MW_", StringComparison.OrdinalIgnoreCase) ||
-               desc.Contains("Calculated Value:", StringComparison.OrdinalIgnoreCase) ||
-               desc.Contains("Power Calculation", StringComparison.OrdinalIgnoreCase) ||
-               desc.Contains("3-Phase", StringComparison.OrdinalIgnoreCase);
+        return DeviceHelper.IsCalculatedValue(row.Description);
     }
 
     /// <summary>
     /// Extracts the canonical line name from a measurement, normalizing variations.
-    /// e.g.: "BOGALUSA_LN_A" and "BOGALUSA_LN_B" both map to base "BOGALUSA_LN"
+    /// e.g.: "OAKDALE_LN_A" and "OAKDALE_LN_B" both map to base "OAKDALE_LN"
     /// Phase suffixes like _IA, _VA are stripped since they indicate phase, not line.
     /// </summary>
     private static string? ExtractCanonicalLineName(MeasurementRow row)
@@ -335,7 +330,7 @@ public static class SttpConfigExporter
 
     /// <summary>
     /// Finds an existing measurement point for a line by exact device and line name match.
-    /// Does not match across different line suffixes (e.g., BOGALUSA_LN_A vs BOGALUSA_LN_B).
+    /// Does not match across different line suffixes (e.g., OAKDALE_LN_A vs OAKDALE_LN_B).
     /// </summary>
     private static string? FindExistingMeasurementPointForLine(
         string device,
@@ -345,7 +340,7 @@ public static class SttpConfigExporter
         // Direct lookup first - exact line name match
         string key = $"{device}|{lineName}";
 
-        // For lines with suffixes (like BOGALUSA_LN_A, BOGALUSA_LN_B), 
+        // For lines with suffixes (like OAKDALE_LN_A, OAKDALE_LN_B),
         // we should NOT match across different suffixes - they are different measurement points
         // Only match if there's an exact base+suffix match or the exact line name
         return deviceLineNameMeasurementPointMap.GetValueOrDefault(key);
@@ -503,7 +498,7 @@ public static class SttpConfigExporter
 
     /// <summary>
     /// Builds a MeasurementPoint name that incorporates the line name with underscore separator.
-    /// Format: STATION_LINENAME (e.g.: ADMSCREEK1_WPEC) or STATION_LINE_X (e.g.: ADMSCREK1_BGLS_A)
+    /// Format: STATION_LINENAME (e.g.: WLLWCREEK1_WCEC) or STATION_LINE_X (e.g.: WLLWCREK1_OKDL_A)
     /// Compresses names by removing vowels when needed to fit 16-character limit.
     /// Preserves important keywords like UNIT and maintains line suffix integrity.
     /// </summary>
@@ -515,8 +510,8 @@ public static class SttpConfigExporter
         if (string.IsNullOrEmpty(normalizedLine))
             return baseName;
 
-        // Extract line suffix if present (e.g.: BOGALUSA_LN_A -> base=BOGALUS, suffix=A)
-        // After normalization: BOGALUSA_LN_A becomes BOGALUSALNA
+        // Extract line suffix if present (e.g.: OAKDALE_LN_A -> base=OAKDALE, suffix=A)
+        // After normalization: OAKDALE_LN_A becomes OAKDALELNA
         string? lineSuffix = null;
         string lineBase = normalizedLine;
 
@@ -642,7 +637,7 @@ public static class SttpConfigExporter
     private static string CompressLineNamePreservingKeywords(string lineName)
     {
         // Short names (3 chars or less) should not be compressed - they become unrecognizable
-        // e.g.: "KEO" -> "K" is not readable, keep as "KEO"
+        // e.g.: "LEO" -> "L" is not readable, keep as "LEO"
         if (lineName.Length <= 3)
             return lineName;
 
@@ -1066,7 +1061,7 @@ public static class SttpConfigExporter
     /// </returns>
     private static string BuildStationFromTokens(List<string> nameTokens, string? unit)
     {
-        // Example: GRAND + GULF + 1 => GRNDGULF1
+        // Example: MAPLE + RIDGE + 1 => MPLRIDGE1
         // Rule: vowel-strip all but last token (keeps last token readable)
         StringBuilder sb = new();
 
@@ -1159,59 +1154,6 @@ public static class SttpConfigExporter
         }
 
         return sb.ToString();
-    }
-
-    /// <summary>
-    /// Determines whether the specified token represents a system prefix.
-    /// </summary>
-    /// <param name="token">The token to evaluate.</param>
-    /// <returns>
-    /// <c>true</c> if the token is a recognized system prefix (e.g., "PMU", "PDC", "SUB", or "SITE");
-    /// otherwise, <c>false</c>.
-    /// </returns>
-    private static bool IsSystemPrefix(string token)
-    {
-        token = token.Trim().ToUpperInvariant();
-        return token is "PMU" or "PDC" or "SUB" or "SITE";
-    }
-
-    /// <summary>
-    /// Determines whether the specified token represents a unit identifier.
-    /// </summary>
-    /// <param name="token">The token to evaluate.</param>
-    /// <returns>
-    /// <c>true</c> if the token is a valid unit identifier (a non-negative integer between 0 and 99); otherwise, <c>false</c>.
-    /// </returns>
-    private static bool IsUnitToken(string token)
-    {
-        if (!int.TryParse(token, NumberStyles.None, CultureInfo.InvariantCulture, out int n))
-            return false;
-
-        return n is >= 0 and <= 99;
-    }
-
-    /// <summary>
-    /// Determines whether the specified token is a valid name token.
-    /// </summary>
-    /// <param name="token">The token to evaluate.</param>
-    /// <returns>
-    /// <c>true</c> if the token is a valid name token; otherwise, <c>false</c>.
-    /// A valid name token is at least three characters long and consists only of alphabetic characters.
-    /// </returns>
-    private static bool IsNameToken(string token)
-    {
-        token = token.Trim();
-
-        if (token.Length < 3)
-            return false;
-
-        foreach (char c in token)
-        {
-            if (c is (< 'A' or > 'Z') and (< 'a' or > 'z'))
-                return false;
-        }
-
-        return true;
     }
 
     // ========= Per-quantity uniqueness suffixing =========

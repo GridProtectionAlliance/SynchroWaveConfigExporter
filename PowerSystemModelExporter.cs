@@ -721,7 +721,7 @@ public static class PowerSystemModelExporter
                     continue;
 
                 // For DFR devices, prefer the name that appears most frequently or is longest
-                // (compound names like "GRAND GULF" are better than truncated names)
+                // (compound names like "MAPLE RIDGE" are better than truncated names)
                 if (stationName is null || extracted.Length > stationName.Length)
                     stationName = extracted;
             }
@@ -1357,17 +1357,6 @@ public static class PowerSystemModelExporter
     }
 
     /// <summary>
-    /// Removes a leading voltage prefix from a normalized label, e.g. "230_EAST_BUS" -&gt; "EAST_BUS"
-    /// or "115KV_N_BUS" -&gt; "N_BUS", so bus labels that carry a voltage prefix in one source but not
-    /// another still match.
-    /// </summary>
-    private static string StripVoltagePrefix(string label)
-    {
-        Match match = Regex.Match(label, @"^\d+(KV)?_(.+)$", RegexOptions.IgnoreCase);
-        return match.Success ? match.Groups[2].Value : label;
-    }
-
-    /// <summary>
     /// Ensures a bus row exists for an explicitly named bus — the bus-voltage measurement point that
     /// a line current is paired with — creating it on demand. Returns the bus identifier, or an
     /// empty string when the station or voltage is invalid.
@@ -1521,59 +1510,6 @@ public static class PowerSystemModelExporter
     }
 
     // ========= Bus measurement points and transformers =========
-
-    /// <summary>Determines whether a phasor label/line name denotes a bus (a voltage node).</summary>
-    private static bool IsBusLabel(string? name)
-    {
-        return !string.IsNullOrWhiteSpace(name) && name.Contains("BUS", StringComparison.OrdinalIgnoreCase);
-    }
-
-    /// <summary>
-    /// Determines whether a phasor label/line name denotes a transformer terminal: a high-side
-    /// (<c>_HS</c>) or low-side (<c>_LS</c>) marker, or an explicit transformer name (XFMR/AUTOTRAN).
-    /// </summary>
-    private static bool IsTransformerLabel(string? name)
-    {
-        if (string.IsNullOrWhiteSpace(name))
-            return false;
-
-        string upper = name.Trim().ToUpperInvariant();
-
-        return upper.EndsWith("_HS", StringComparison.Ordinal) ||
-               upper.EndsWith("_LS", StringComparison.Ordinal) ||
-               upper.Contains("XFMR", StringComparison.Ordinal) ||
-               upper.Contains("AUTOTRAN", StringComparison.Ordinal);
-    }
-
-    /// <summary>
-    /// Returns "HS", "LS", or empty string for a transformer terminal's winding side.
-    /// </summary>
-    private static string TransformerSide(string name)
-    {
-        string upper = name.Trim().ToUpperInvariant();
-
-        if (upper.EndsWith("_HS", StringComparison.Ordinal))
-            return "HS";
-
-        if (upper.EndsWith("_LS", StringComparison.Ordinal))
-            return "LS";
-
-        return string.Empty;
-    }
-
-    /// <summary>
-    /// Returns a transformer identity key from a terminal label by removing the winding-side
-    /// suffix, e.g. "AUTO_1_HS" and "AUTO_1_LS" both yield "AUTO_1".
-    /// </summary>
-    private static string TransformerKey(string name)
-    {
-        string id = NormalizeToID(name);
-
-        if (id.EndsWith("_HS", StringComparison.Ordinal) || id.EndsWith("_LS", StringComparison.Ordinal))
-            id = id[..^3];
-
-        return id;
-    }
 
     /// <summary>
     /// Builds, per device acronym, a map from a phasor label (phase suffix stripped, uppercased)
