@@ -56,12 +56,14 @@ public static class PowerSystemModelExporter
     /// from the openHistorian database.
     /// </summary>
     /// <param name="connection">Open database connection to the openHistorian instance.</param>
+    /// <param name="signalMappings">The STTP signal mappings produced by <see cref="SttpConfigExporter"/>, carrying each measurement point with its database-authoritative phasor label and signal id.</param>
     /// <returns>Summary of export results including counts of derived entities.</returns>
-    /// <exception cref="ArgumentNullException">Thrown when <paramref name="connection"/> is <c>null</c>.</exception>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="connection"/> or <paramref name="signalMappings"/> is <c>null</c>.</exception>
     /// <exception cref="ArgumentException">Thrown when any of the required CSV output paths in <see cref="Settings"/> are null or empty.</exception>
-    public static ModelExportResult Export(DbConnection connection)
+    public static ModelExportResult Export(DbConnection connection, IReadOnlyList<SttpConfigExporter.SignalMapping> signalMappings)
     {
         ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(signalMappings);
         ArgumentException.ThrowIfNullOrWhiteSpace(Settings.StationsCsvPath);
         ArgumentException.ThrowIfNullOrWhiteSpace(Settings.BusesCsvPath);
         ArgumentException.ThrowIfNullOrWhiteSpace(Settings.LinesCsvPath);
@@ -74,8 +76,10 @@ public static class PowerSystemModelExporter
         List<string> sampleNames = devices.Take(10).Select(device => device.Name).ToList();
         List<int> sampleBaseKVs = idPhasorMap.Values.Take(10).Select(phasor => phasor.BaseKV).Distinct().ToList();
 
-        // 2) Load existing signal mappings for terminal measurement point lookup and DFR line extraction
-        (Dictionary<string, string> terminalMPs, Dictionary<string, List<DFRLineInfo>> deviceDFRLinesMap) = LoadTerminalMeasurementPointsAndDFRLines();
+        // 2) Build terminal measurement points and per-device DFR line/bus info directly from the
+        //    STTP signal mappings. Each mapping carries the database's clean phasor label, so line
+        //    and bus names need no CSV re-read or free-text description parsing.
+        (Dictionary<string, string> terminalMPs, Dictionary<string, List<DFRLineInfo>> deviceDFRLinesMap) = BuildTerminalsAndDFRLines(signalMappings);
 
         // 3) Derive stations by grouping devices on GPS coordinates
         (List<StationRow> stations, int coordGroupsFound, int skippedNoName, int skippedNoVoltage, List<string> skippedNoNameDetails, List<string> skippedNoVoltageDetails) = DeriveStations(devices, idPhasorMap);
@@ -122,7 +126,7 @@ public static class PowerSystemModelExporter
         ComputeAdjacentBuses(buses, lines);
 
         // 10) Report measurement points anchored to neither a line terminal nor a bus, then validate
-        Dictionary<string, MeasurementPointInfo> allMeasurementPoints = LoadAllMeasurementPoints();
+        Dictionary<string, MeasurementPointInfo> allMeasurementPoints = BuildMeasurementPointInfo(signalMappings);
 
         HashSet<string> anchoredMeasurementPoints = new(usedTerminalMPs, StringComparer.OrdinalIgnoreCase);
 
@@ -405,7 +409,8 @@ public static class PowerSystemModelExporter
     private static (List<DeviceRecord> Devices, Dictionary<int, PhasorRecord> IDPhasorMap) LoadDeviceRecords(DbConnection connection)
     {
         // Load all enabled, non-concentrator devices with valid coordinates
-        const string DeviceSQL = """
+        const string DeviceSQL = 
+            """
             SELECT ID, Acronym, ISNULL(Name, Acronym) AS Name, Latitude, Longitude,
                 IsConcentrator, ParentID
             FROM Device
@@ -414,7 +419,8 @@ public static class PowerSystemModelExporter
                 Longitude IS NOT NULL
             """;
 
-        const string PhasorSQL = """
+        const string PhasorSQL = 
+            """
             SELECT ID, DeviceID, Label, Type, Phase, BaseKV, DestinationPhasorID
             FROM Phasor
             ORDER BY DeviceID, SourceIndex
@@ -494,125 +500,90 @@ public static class PowerSystemModelExporter
         return (devices, idPhasorMap);
     }
 
-    // ========= Terminal measurement point lookup =========
+    // ========= Terminal and DFR line/bus derivation from signal mappings =========
 
     /// <summary>
-    /// Loads the existing SEL signal mappings CSV to build:
-    /// 1. A lookup from DeviceAcronym to the base MeasurementPoint used for voltage phasor signals.
-    /// 2. For DFR devices, a lookup of line names extracted from the Description field.
+    /// Builds, from the STTP signal mappings, the per-device terminal measurement point and the
+    /// per-DFR-device list of line/bus terminals. Line and bus names come from each mapping's clean
+    /// phasor label (database-authoritative), so no CSV re-read or free-text description parsing is
+    /// needed, and only phasor measurements (those carrying a phasor label) define lines and buses,
+    /// so calculated-power rows cannot mis-parse into spurious lines.
     /// </summary>
+    /// <param name="signalMappings">The STTP signal mappings produced by the configuration export.</param>
     /// <returns>
-    /// A tuple containing:
-    /// <list type="bullet">
-    /// <item><description>A dictionary mapping device acronyms to terminal measurement point identifiers</description></item>
-    /// <item><description>A dictionary mapping DFR device acronyms to lists of line information extracted from descriptions</description></item>
-    /// </list>
+    /// A tuple containing a dictionary mapping device acronyms to their terminal measurement point,
+    /// and a dictionary mapping DFR device acronyms to their distinct line/bus terminals.
     /// </returns>
     /// <remarks>
-    /// <para>
-    /// The terminal measurement point is determined by finding voltage magnitude measurements
-    /// in the signal mappings, with preference given to PhaseA.Voltage.Magnitude, then
-    /// Phase1.Voltage.Magnitude, then any Voltage.Magnitude measurement.
-    /// </para>
-    /// <para>
-    /// For DFR devices, line names are extracted from the Description field and grouped
-    /// by device acronym for later use in line derivation.
-    /// </para>
+    /// The terminal measurement point prefers PhaseA.Voltage.Magnitude, then Phase1.Voltage.Magnitude,
+    /// then any voltage magnitude, then any voltage signal. Terminal voltage levels are resolved later
+    /// from the phasor graph, so they are left unset (0) here.
     /// </remarks>
-    private static (Dictionary<string, string> TerminalMPs, Dictionary<string, List<DFRLineInfo>> DeviceDFRLinesMap) LoadTerminalMeasurementPointsAndDFRLines()
+    private static (Dictionary<string, string> TerminalMPs, Dictionary<string, List<DFRLineInfo>> DeviceDFRLinesMap) BuildTerminalsAndDFRLines(
+        IReadOnlyList<SttpConfigExporter.SignalMapping> signalMappings)
     {
         Dictionary<string, string> terminalMPs = new(StringComparer.OrdinalIgnoreCase);
         Dictionary<string, List<DFRLineInfo>> deviceDFRLinesMap = new(StringComparer.OrdinalIgnoreCase);
 
-        string csvPath = Settings.SttpSelConfigCsvPath;
+        // Group mappings by device, ignoring rows without a device or measurement point.
+        Dictionary<string, List<SttpConfigExporter.SignalMapping>> deviceMappings = new(StringComparer.OrdinalIgnoreCase);
 
-        if (string.IsNullOrWhiteSpace(csvPath) || !File.Exists(csvPath))
-            return (terminalMPs, deviceDFRLinesMap);
-
-        // Read signal mappings and find voltage magnitude entries (PhaseA.Voltage.Magnitude
-        // preferred, falling back to Phase1.Voltage.Magnitude, then any Voltage.Magnitude)
-        // for each device acronym. The MeasurementPoint on those rows is the terminal MP.
-        Dictionary<string, List<(string MP, string Quantity, string Description)>> deviceCandidateMap = new(StringComparer.OrdinalIgnoreCase);
-
-        foreach (string rawLine in File.ReadLines(csvPath).Skip(1))
+        foreach (SttpConfigExporter.SignalMapping mapping in signalMappings)
         {
-            string line = rawLine.Trim();
-
-            if (line.Length == 0)
+            if (string.IsNullOrWhiteSpace(mapping.DeviceAcronym) || string.IsNullOrWhiteSpace(mapping.MeasurementPoint))
                 continue;
 
-            string[] fields = ParseCSVLine(line);
-
-            if (fields.Length < 4)
-                continue;
-
-            string deviceAcronym = fields[0].Trim();
-            string description = fields.Length > 1 ? fields[1].Trim() : string.Empty;
-            string measurementPoint = fields[2].Trim();
-            string quantity = fields[3].Trim();
-
-            if (string.IsNullOrWhiteSpace(deviceAcronym) || string.IsNullOrWhiteSpace(measurementPoint))
-                continue;
-
-            if (!deviceCandidateMap.TryGetValue(deviceAcronym, out List<(string, string, string)>? list))
+            if (!deviceMappings.TryGetValue(mapping.DeviceAcronym, out List<SttpConfigExporter.SignalMapping>? list))
             {
                 list = [];
-                deviceCandidateMap[deviceAcronym] = list;
+                deviceMappings[mapping.DeviceAcronym] = list;
             }
 
-            list.Add((measurementPoint, quantity, description));
+            list.Add(mapping);
         }
 
-        // For each device, pick the best terminal MP and extract DFR line info
-        foreach ((string device, List<(string MP, string Quantity, string Description)> candidates) in deviceCandidateMap)
+        foreach ((string device, List<SttpConfigExporter.SignalMapping> mappings) in deviceMappings)
         {
-            // Extract terminal MP (voltage-related quantities for terminal identification)
-            string? best = candidates
-                .Where(candidate => candidate.Quantity.Equals("PhaseA.Voltage.Magnitude", StringComparison.OrdinalIgnoreCase))
-                .Select(candidate => candidate.MP)
+            // Terminal MP: a voltage magnitude point identifies the device's terminal.
+            string? best = mappings
+                .Where(mapping => mapping.Quantity.Equals("PhaseA.Voltage.Magnitude", StringComparison.OrdinalIgnoreCase))
+                .Select(mapping => mapping.MeasurementPoint)
                 .FirstOrDefault();
 
-            best ??= candidates
-                .Where(candidate => candidate.Quantity.Equals("Phase1.Voltage.Magnitude", StringComparison.OrdinalIgnoreCase))
-                .Select(candidate => candidate.MP)
+            best ??= mappings
+                .Where(mapping => mapping.Quantity.Equals("Phase1.Voltage.Magnitude", StringComparison.OrdinalIgnoreCase))
+                .Select(mapping => mapping.MeasurementPoint)
                 .FirstOrDefault();
 
-            best ??= candidates
-                .Where(candidate => candidate.Quantity.Contains("Voltage.Magnitude", StringComparison.OrdinalIgnoreCase))
-                .Select(candidate => candidate.MP)
+            best ??= mappings
+                .Where(mapping => mapping.Quantity.Contains("Voltage.Magnitude", StringComparison.OrdinalIgnoreCase))
+                .Select(mapping => mapping.MeasurementPoint)
                 .FirstOrDefault();
 
-            best ??= candidates
-                .Where(candidate => candidate.Quantity.Contains("Voltage", StringComparison.OrdinalIgnoreCase))
-                .Select(candidate => candidate.MP)
+            best ??= mappings
+                .Where(mapping => mapping.Quantity.Contains("Voltage", StringComparison.OrdinalIgnoreCase))
+                .Select(mapping => mapping.MeasurementPoint)
                 .FirstOrDefault();
 
             if (!string.IsNullOrWhiteSpace(best))
                 terminalMPs[device] = best;
 
-            // For DFR devices, extract line information from descriptions
             if (!IsDFRDevice(device))
                 continue;
 
-            // Group by measurement point to find distinct lines
+            // Each distinct phasor label at the device is a line/bus terminal. Rows without a phasor
+            // label (e.g., calculated power values) do not define lines/buses and are skipped.
             HashSet<string> seenLineNames = new(StringComparer.OrdinalIgnoreCase);
 
-            foreach ((string mp, string _, string desc) in candidates)
+            foreach (SttpConfigExporter.SignalMapping mapping in mappings)
             {
-                // Extract line name from description using shared helper
-                string? lineName = ExtractLineNameFromDescription(desc);
-
-                if (string.IsNullOrWhiteSpace(lineName))
+                if (string.IsNullOrWhiteSpace(mapping.PhasorLabel))
                     continue;
 
-                // Strip phase suffix to get canonical line name
-                lineName = StripPhaseSuffix(lineName);
+                string lineName = StripPhaseSuffix(mapping.PhasorLabel);
 
                 if (string.IsNullOrWhiteSpace(lineName) || !seenLineNames.Add(lineName))
                     continue;
-
-                // Try to extract voltage from the description (e.g., "115kV" or "230KV")
-                int voltageKV = ExtractVoltageFromDescription(desc);
 
                 if (!deviceDFRLinesMap.TryGetValue(device, out List<DFRLineInfo>? lineList))
                 {
@@ -620,33 +591,12 @@ public static class PowerSystemModelExporter
                     deviceDFRLinesMap[device] = lineList;
                 }
 
-                lineList.Add(new DFRLineInfo(lineName, mp, voltageKV));
+                // Voltage is resolved from the phasor graph during derivation, so it is left at 0 here.
+                lineList.Add(new DFRLineInfo(lineName, mapping.MeasurementPoint, 0));
             }
         }
 
         return (terminalMPs, deviceDFRLinesMap);
-    }
-
-    /// <summary>
-    /// Extracts voltage level (kV) from a description string.
-    /// </summary>
-    /// <param name="desc">The description string to parse (e.g., "115kV_BUS" or "230KV LINE").</param>
-    /// <returns>The voltage level in kV, or 0 if no valid voltage is found.</returns>
-    /// <remarks>
-    /// Recognizes patterns like "115kV", "230KV", or "500 kV" (case-insensitive, with optional space).
-    /// </remarks>
-    private static int ExtractVoltageFromDescription(string desc)
-    {
-        if (string.IsNullOrWhiteSpace(desc))
-            return 0;
-
-        // Look for pattern like "115kV" or "230KV" or "500 kV"
-        Match match = Regex.Match(desc, @"(\d+)\s*[kK][vV]", RegexOptions.IgnoreCase);
-
-        if (match.Success && int.TryParse(match.Groups[1].Value, out int kv))
-            return kv;
-
-        return 0;
     }
 
     // ========= Phasor voltage resolution =========
@@ -960,7 +910,7 @@ public static class PowerSystemModelExporter
             {
                 buses.Add(new BusRow
                 {
-                    BusID = CanonicalBusId(stationID, kv, canonicalBus),
+                    BusID = CanonicalBusID(stationID, kv, canonicalBus),
                     StationID = stationID,
                     NominalVoltageKV = kv
                 });
@@ -1268,7 +1218,7 @@ public static class PowerSystemModelExporter
         if (string.IsNullOrWhiteSpace(stationID) || kv <= 0 || !idStationMap.ContainsKey(stationID))
             return string.Empty;
 
-        string busID = CanonicalBusId(stationID, kv, canonicalBus);
+        string busID = CanonicalBusID(stationID, kv, canonicalBus);
 
         if (idBusMap.ContainsKey(busID))
             return busID;
@@ -1291,7 +1241,7 @@ public static class PowerSystemModelExporter
     /// point name at that station/voltage when one exists (so connected lines reference the
     /// measured bus), otherwise the notional "{StationId}_{kv}_BUS" name.
     /// </summary>
-    private static string CanonicalBusId(string stationID, int kv, Dictionary<string, string> canonicalBus)
+    private static string CanonicalBusID(string stationID, int kv, Dictionary<string, string> canonicalBus)
     {
         return canonicalBus.GetValueOrDefault($"{stationID}|{kv}", $"{stationID}_{kv}_BUS");
     }
@@ -1353,8 +1303,8 @@ public static class PowerSystemModelExporter
 
                     string key = NormalizeToID(StripPhaseSuffix(phasor.Label));
 
-                    if (key.Length > 0 && !busLabelToMP.ContainsKey(key))
-                        busLabelToMP[key] = onlyBusMP;
+                    if (key.Length > 0)
+                        busLabelToMP.TryAdd(key, onlyBusMP);
                 }
             }
 
@@ -1456,9 +1406,9 @@ public static class PowerSystemModelExporter
         List<BusRow> buses,
         Dictionary<string, string> canonicalBus)
     {
-        return string.IsNullOrWhiteSpace(busOverride)
-            ? EnsureBus(stationID, kv, idStationMap, idBusMap, buses, canonicalBus)
-            : EnsureNamedBus(busOverride, stationID, kv, idStationMap, idBusMap, buses);
+        return string.IsNullOrWhiteSpace(busOverride) ? 
+            EnsureBus(stationID, kv, idStationMap, idBusMap, buses, canonicalBus) : 
+            EnsureNamedBus(busOverride, stationID, kv, idStationMap, idBusMap, buses);
     }
 
     // ========= Possible-typo diagnostics =========
@@ -1488,13 +1438,13 @@ public static class PowerSystemModelExporter
                 if (remote.Equals(station, StringComparison.OrdinalIgnoreCase))
                     continue;
 
-                if (WithinOneEdit(remote, station))
-                {
-                    string message = $"line endpoint \"{remote}\" closely resembles station \"{station}\"";
+                if (!WithinOneEdit(remote, station))
+                    continue;
+                
+                string message = $"line endpoint \"{remote}\" closely resembles station \"{station}\"";
 
-                    if (seen.Add(message))
-                        messages.Add(message);
-                }
+                if (seen.Add(message))
+                    messages.Add(message);
             }
         }
 
@@ -1502,13 +1452,13 @@ public static class PowerSystemModelExporter
         {
             for (int j = i + 1; j < stations.Count; j++)
             {
-                if (WithinOneEdit(stations[i], stations[j]))
-                {
-                    string message = $"stations \"{stations[i]}\" and \"{stations[j]}\" closely resemble each other";
+                if (!WithinOneEdit(stations[i], stations[j]))
+                    continue;
+                
+                string message = $"stations \"{stations[i]}\" and \"{stations[j]}\" closely resemble each other";
 
-                    if (seen.Add(message))
-                        messages.Add(message);
-                }
+                if (seen.Add(message))
+                    messages.Add(message);
             }
         }
 
@@ -1595,7 +1545,9 @@ public static class PowerSystemModelExporter
                upper.Contains("AUTOTRAN", StringComparison.Ordinal);
     }
 
-    /// <summary>Returns "HS", "LS", or empty string for a transformer terminal's winding side.</summary>
+    /// <summary>
+    /// Returns "HS", "LS", or empty string for a transformer terminal's winding side.
+    /// </summary>
     private static string TransformerSide(string name)
     {
         string upper = name.Trim().ToUpperInvariant();
@@ -1830,9 +1782,9 @@ public static class PowerSystemModelExporter
                 if (!IsTransformerLabel(dfrLine.LineName))
                     continue;
 
-                string mp = string.IsNullOrWhiteSpace(dfrLine.MeasurementPoint)
-                    ? terminalMPs.GetValueOrDefault(device.Acronym) ?? string.Empty
-                    : dfrLine.MeasurementPoint;
+                string mp = string.IsNullOrWhiteSpace(dfrLine.MeasurementPoint) ? 
+                    terminalMPs.GetValueOrDefault(device.Acronym) ?? string.Empty : 
+                    dfrLine.MeasurementPoint;
 
                 if (string.IsNullOrWhiteSpace(mp) || !seen.Add(mp))
                     continue;
@@ -1991,48 +1943,32 @@ public static class PowerSystemModelExporter
     private sealed record MeasurementPointInfo(string Description, bool HasVoltage, bool HasCurrent);
 
     /// <summary>
-    /// Loads every distinct measurement point from the signal mappings CSV with a representative
+    /// Builds, from the STTP signal mappings, each distinct measurement point with a representative
     /// description and whether it carries voltage and/or current quantities. Used to report and
     /// classify measurement points that are not associated with the model.
     /// </summary>
+    /// <param name="signalMappings">The STTP signal mappings produced by the configuration export.</param>
     /// <returns>A dictionary mapping each measurement point to its description and quantity content.</returns>
-    private static Dictionary<string, MeasurementPointInfo> LoadAllMeasurementPoints()
+    private static Dictionary<string, MeasurementPointInfo> BuildMeasurementPointInfo(IReadOnlyList<SttpConfigExporter.SignalMapping> signalMappings)
     {
         Dictionary<string, string> descriptions = new(StringComparer.OrdinalIgnoreCase);
         HashSet<string> hasVoltage = new(StringComparer.OrdinalIgnoreCase);
         HashSet<string> hasCurrent = new(StringComparer.OrdinalIgnoreCase);
 
-        string csvPath = Settings.SttpSelConfigCsvPath;
-
-        if (!string.IsNullOrWhiteSpace(csvPath) && File.Exists(csvPath))
+        foreach (SttpConfigExporter.SignalMapping mapping in signalMappings)
         {
-            foreach (string rawLine in File.ReadLines(csvPath).Skip(1))
-            {
-                string line = rawLine.Trim();
+            string mp = mapping.MeasurementPoint;
 
-                if (line.Length == 0)
-                    continue;
+            if (string.IsNullOrWhiteSpace(mp))
+                continue;
 
-                string[] fields = ParseCSVLine(line);
+            if (!descriptions.ContainsKey(mp))
+                descriptions[mp] = mapping.Description;
 
-                if (fields.Length < 4)
-                    continue;
-
-                string mp = fields[2].Trim();
-
-                if (mp.Length == 0)
-                    continue;
-
-                if (!descriptions.ContainsKey(mp))
-                    descriptions[mp] = fields[1].Trim();
-
-                string quantity = fields[3];
-
-                if (quantity.Contains("Voltage", StringComparison.OrdinalIgnoreCase))
-                    hasVoltage.Add(mp);
-                else if (quantity.Contains("Current", StringComparison.OrdinalIgnoreCase))
-                    hasCurrent.Add(mp);
-            }
+            if (mapping.Quantity.Contains("Voltage", StringComparison.OrdinalIgnoreCase))
+                hasVoltage.Add(mp);
+            else if (mapping.Quantity.Contains("Current", StringComparison.OrdinalIgnoreCase))
+                hasCurrent.Add(mp);
         }
 
         Dictionary<string, MeasurementPointInfo> result = new(StringComparer.OrdinalIgnoreCase);
@@ -2074,7 +2010,7 @@ public static class PowerSystemModelExporter
                 // Was a real terminal candidate; its terminal is already represented by another point.
                 redundant++;
             }
-            else if (info.HasVoltage && info.HasCurrent)
+            else if (info is { HasVoltage: true, HasCurrent: true })
             {
                 // A complete terminal that was never modelable — the actionable gap.
                 genuineVI++;
@@ -2146,35 +2082,55 @@ public static class PowerSystemModelExporter
 
     /// <summary>
     /// Identifies line terminals that cannot yield a power calculation because their current has no
-    /// usable voltage source — the terminal measurement point carries no voltage of its own and its
-    /// bus is notional (carries no measured voltage). Reports them so power-calc coverage is visible.
+    /// usable voltage source. A terminal's current can be paired with a voltage when its own
+    /// measurement point carries voltage, or when its bus has an observable voltage — either the bus
+    /// is itself a measured voltage point, or some line terminal on that bus carries voltage (a line
+    /// VT senses the bus voltage, which SEL uses as the adjacent-bus voltage for the other terminals
+    /// on that bus). Reports the terminals with no voltage source at all so coverage is visible.
     /// </summary>
     private static List<string> AnalyzePowerCalcCoverage(
         List<LineRow> lines,
         Dictionary<string, MeasurementPointInfo> allMeasurementPoints,
         HashSet<string> busMeasurementPointNames)
     {
+        // A bus's voltage is observable if the bus is a measured voltage point, or if any line
+        // terminal sitting on it carries its own voltage (its VT senses the shared bus voltage).
+        HashSet<string> busHasVoltage = new(busMeasurementPointNames, StringComparer.OrdinalIgnoreCase);
+
+        foreach (LineRow line in lines)
+        {
+            if (!string.IsNullOrWhiteSpace(line.FromBusID) && !string.IsNullOrWhiteSpace(line.FromTerminalMP) && hasOwnVoltage(line.FromTerminalMP))
+                busHasVoltage.Add(line.FromBusID);
+
+            if (!string.IsNullOrWhiteSpace(line.ToBusID) && !string.IsNullOrWhiteSpace(line.ToTerminalMP) && hasOwnVoltage(line.ToTerminalMP))
+                busHasVoltage.Add(line.ToBusID);
+        }
+
         List<string> gaps = [];
 
-        void CheckSide(string lineID, string side, string mp, string busID)
+        foreach (LineRow line in lines)
+        {
+            checkSide(line.LineID, "From", line.FromTerminalMP, line.FromBusID);
+            checkSide(line.LineID, "To", line.ToTerminalMP, line.ToBusID);
+        }
+
+        return gaps;
+
+        bool hasOwnVoltage(string mp)
+        {
+            return allMeasurementPoints.TryGetValue(mp, out MeasurementPointInfo? info) && info.HasVoltage;
+        }
+
+        void checkSide(string lineID, string side, string mp, string busID)
         {
             if (string.IsNullOrWhiteSpace(mp))
                 return;
 
-            bool mpHasOwnVoltage = allMeasurementPoints.TryGetValue(mp, out MeasurementPointInfo? info) && info.HasVoltage;
-            bool busHasVoltage = !string.IsNullOrWhiteSpace(busID) && busMeasurementPointNames.Contains(busID);
+            if (hasOwnVoltage(mp) || (!string.IsNullOrWhiteSpace(busID) && busHasVoltage.Contains(busID)))
+                return;
 
-            if (!mpHasOwnVoltage && !busHasVoltage)
-                gaps.Add($"{lineID} [{side}]: {mp} current has no voltage source (bus {(string.IsNullOrWhiteSpace(busID) ? "<none>" : busID)})");
+            gaps.Add($"{lineID} [{side}]: {mp} current has no voltage source (bus {(string.IsNullOrWhiteSpace(busID) ? "<none>" : busID)})");
         }
-
-        foreach (LineRow line in lines)
-        {
-            CheckSide(line.LineID, "From", line.FromTerminalMP, line.FromBusID);
-            CheckSide(line.LineID, "To", line.ToTerminalMP, line.ToBusID);
-        }
-
-        return gaps;
     }
 
     /// <summary>
@@ -2345,43 +2301,7 @@ public static class PowerSystemModelExporter
         return $"{Math.Round(lat, 2):F2}|{Math.Round(lon, 2):F2}";
     }
 
-    // ========= CSV parsing/writing =========
-
-    /// <summary>
-    /// Parses a CSV line into fields, respecting quoted values that may contain commas.
-    /// </summary>
-    /// <param name="line">The CSV line to parse.</param>
-    /// <returns>An array of field values extracted from the line.</returns>
-    /// <remarks>
-    /// Handles double-quoted fields containing commas and preserves the content within quotes.
-    /// </remarks>
-    private static string[] ParseCSVLine(string line)
-    {
-        List<string> fields = [];
-        bool inQuotes = false;
-        StringBuilder current = new();
-
-        foreach (char c in line)
-        {
-            switch (c)
-            {
-                case '"':
-                    inQuotes = !inQuotes;
-                    break;
-                case ',' when !inQuotes:
-                    fields.Add(current.ToString());
-                    current.Clear();
-                    break;
-                default:
-                    current.Append(c);
-                    break;
-            }
-        }
-
-        fields.Add(current.ToString());
-
-        return [.. fields];
-    }
+    // ========= CSV writing =========
 
     /// <summary>
     /// Writes the stations list to a CSV file.

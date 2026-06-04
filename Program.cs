@@ -151,7 +151,7 @@ internal class Program
 
             // Export SEL STTP signal mappings
             Console.WriteLine("Exporting SEL STTP Signal Mappings...");
-            SttpConfigExporter.ConfigExportResult configResult = SttpConfigExporter.Export(database.Connection, GetCompanyAcronym());
+            (SttpConfigExporter.ConfigExportResult configResult, IReadOnlyList<SttpConfigExporter.SignalMapping> signalMappings) = SttpConfigExporter.Export(database.Connection, GetCompanyAcronym());
 
             Console.WriteLine($"  Total measurements loaded: {configResult.TotalLoaded:N0}");
             Console.WriteLine($"  Measurements exported: {configResult.Exported:N0}");
@@ -161,7 +161,7 @@ internal class Program
 
             // Export power system model (stations, buses, lines)
             Console.WriteLine("Exporting Power System Model...");
-            PowerSystemModelExporter.ModelExportResult modelResult = PowerSystemModelExporter.Export(database.Connection);
+            PowerSystemModelExporter.ModelExportResult modelResult = PowerSystemModelExporter.Export(database.Connection, signalMappings);
 
             Console.WriteLine($"  Total devices analyzed: {modelResult.TotalDevicesAnalyzed:N0}");
             Console.WriteLine($"  Devices with phasors: {modelResult.DevicesWithPhasors:N0}");
@@ -187,7 +187,7 @@ internal class Program
             if (modelResult.OrphanGenuineGaps.Count > 0)
             {
                 Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.WriteLine($"    Genuine gaps (complete V+I terminals with no model anchor) — likely missing source voltage:");
+                Console.WriteLine("    Genuine gaps (complete V+I terminals with no model anchor) — likely missing source voltage:");
 
                 foreach (string gap in modelResult.OrphanGenuineGaps.Take(20))
                     Console.WriteLine($"      - {gap}");
@@ -309,17 +309,26 @@ internal class Program
                 Console.WriteLine("WARNING: No stations were exported!");
                 
                 if (modelResult.TotalDevicesAnalyzed == 0)
+                {
                     Console.WriteLine("  - No devices were loaded from the database.");
+                }
                 else if (modelResult.DevicesWithPhasors == 0)
+                {
                     Console.WriteLine("  - No devices have phasors attached.");
+                }
                 else if (modelResult.TotalPhasorsLoaded == 0)
+                {
                     Console.WriteLine("  - No phasors were loaded from the database.");
+                }
                 else if (modelResult.CoordinateGroupsFound == 0)
+                {
                     Console.WriteLine("  - No devices have valid GPS coordinates.");
+                }
                 else
                 {
                     if (modelResult.StationsSkippedNoName > 0)
                         Console.WriteLine($"  - {modelResult.StationsSkippedNoName} group(s) skipped: could not extract station name from device acronym/name.");
+                    
                     if (modelResult.StationsSkippedNoVoltage > 0)
                         Console.WriteLine($"  - {modelResult.StationsSkippedNoVoltage} group(s) skipped: no phasors with valid voltage (BaseKV > 0).");
                     

@@ -21,6 +21,7 @@
 //
 //******************************************************************************************************
 // ReSharper disable NotAccessedPositionalProperty.Local
+#pragma warning disable CA1806
 
 namespace SynchroWaveConfigExporter;
 
@@ -208,9 +209,9 @@ public static class DashMenuExporter
             if (string.IsNullOrWhiteSpace(stationId))
                 continue;
 
-            _ = decimal.TryParse(fields[1].Trim(), out decimal latitude);
-            _ = decimal.TryParse(fields[2].Trim(), out decimal longitude);
-            _ = int.TryParse(fields[3].Trim(), out int nominalKV);
+            decimal.TryParse(fields[1].Trim(), out decimal latitude);
+            decimal.TryParse(fields[2].Trim(), out decimal longitude);
+            int.TryParse(fields[3].Trim(), out int nominalKV);
 
             stations.Add(new StationRecord(stationId, latitude, longitude, nominalKV));
         }
@@ -247,7 +248,7 @@ public static class DashMenuExporter
             if (string.IsNullOrWhiteSpace(busId))
                 continue;
 
-            _ = int.TryParse(fields[2].Trim(), out int nominalKV);
+            int.TryParse(fields[2].Trim(), out int nominalKV);
             string adjacentBusIds = fields.Length > 3 ? fields[3].Trim() : string.Empty;
 
             buses.Add(new BusRecord(busId, stationId, nominalKV, adjacentBusIds));
@@ -289,7 +290,7 @@ public static class DashMenuExporter
             string fromBusId = fields[3].Trim();
             string toBusId = fields[4].Trim();
 
-            _ = int.TryParse(fields[5].Trim(), out int nominalKV);
+            int.TryParse(fields[5].Trim(), out int nominalKV);
 
             lines.Add(new LineRecord(lineId, fromTerminalMP, toTerminalMP, fromBusId, toBusId, nominalKV));
         }

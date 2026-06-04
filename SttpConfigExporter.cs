@@ -48,7 +48,7 @@ public static class SttpConfigExporter
     /// <returns>Result containing export statistics including total loaded, exported, invalid, and generated counts.</returns>
     /// <exception cref="ArgumentNullException">Thrown when connection is null.</exception>
     /// <exception cref="ArgumentException">Thrown when SttpSelConfigCsvPath setting is null or whitespace.</exception>
-    public static ConfigExportResult Export(DbConnection connection, string companyAcronym)
+    public static (ConfigExportResult Result, IReadOnlyList<SignalMapping> Mappings) Export(DbConnection connection, string companyAcronym)
     {
         ArgumentNullException.ThrowIfNull(connection);
         ArgumentException.ThrowIfNullOrWhiteSpace(Settings.SttpSelConfigCsvPath);
@@ -65,17 +65,21 @@ public static class SttpConfigExporter
             PersistAlternateTagUpdates(connection, plan.Updates);
 
         // 4) Build config rows using phasor/line grouping for consistent MeasurementPoint assignment
-        List<SelConfigRow> configRows = BuildConfigRowsWithLineGrouping(rows, plan);
+        List<SignalMapping> configRows = BuildConfigRowsWithLineGrouping(rows, plan);
 
         // 5) Write output CSV
         WriteSelCSV(Settings.SttpSelConfigCsvPath, configRows);
 
-        return new ConfigExportResult(
+        // Return the mappings (including the clean phasor label and signal id) so the power system
+        // model exporter can associate measurement points without re-reading and reparsing the CSV.
+        ConfigExportResult result = new(
             TotalLoaded: rows.Count,
             Exported: configRows.Count,
             InvalidAlternateTagTooLong: plan.InvalidForExportSignalIDs.Count,
             AlternateTagsGenerated: plan.Updates.Count
         );
+
+        return (result, configRows);
     }
 
     // ========= Config row building with line grouping =========
@@ -87,9 +91,9 @@ public static class SttpConfigExporter
     /// non-phasor measurements (frequency, dF/dt, calculated values) which may share
     /// measurement points with their associated phasors.
     /// </summary>
-    private static List<SelConfigRow> BuildConfigRowsWithLineGrouping(List<MeasurementRow> rows, AlternateTagPlan plan)
+    private static List<SignalMapping> BuildConfigRowsWithLineGrouping(List<MeasurementRow> rows, AlternateTagPlan plan)
     {
-        List<SelConfigRow> configRows = [];
+        List<SignalMapping> configRows = [];
 
         // Track used measurement point + quantity combinations (case-insensitive)
         // Ensures each MeasurementPoint + Quantity pair appears only once in output
@@ -179,11 +183,13 @@ public static class SttpConfigExporter
                 continue;
 
             // This MeasurementPoint + Quantity combination is new, add it
-            configRows.Add(new SelConfigRow(
+            configRows.Add(new SignalMapping(
                 DeviceAcronym: row.Device ?? string.Empty,
                 Description: row.Description ?? string.Empty,
                 MeasurementPoint: assignedMP,
-                Quantity: quantity
+                Quantity: quantity,
+                SignalID: row.SignalID,
+                PhasorLabel: row.PhasorLabel ?? string.Empty
             ));
         }
 
@@ -261,11 +267,13 @@ public static class SttpConfigExporter
                 continue;
 
             // This MeasurementPoint + Quantity combination is new, add it
-            configRows.Add(new SelConfigRow(
+            configRows.Add(new SignalMapping(
                 DeviceAcronym: row.Device ?? string.Empty,
                 Description: row.Description ?? string.Empty,
                 MeasurementPoint: assignedMP,
-                Quantity: quantity
+                Quantity: quantity,
+                SignalID: row.SignalID,
+                PhasorLabel: row.PhasorLabel ?? string.Empty
             ));
         }
 
@@ -698,17 +706,24 @@ public static class SttpConfigExporter
         string? PhasorLabel);
 
     /// <summary>
-    /// Represents a single row in the SEL configuration CSV output.
+    /// A mapping of one STTP signal to its SEL measurement point and quantity. The first four
+    /// fields are written to the signal mappings CSV; <see cref="SignalID"/> and
+    /// <see cref="PhasorLabel"/> are the database-authoritative identifiers the power system model
+    /// exporter uses to associate measurement points without re-reading or reparsing the CSV.
     /// </summary>
     /// <param name="DeviceAcronym">Device acronym/identifier.</param>
     /// <param name="Description">Human-readable description of the measurement.</param>
     /// <param name="MeasurementPoint">16-character measurement point name (SEL-compatible).</param>
     /// <param name="Quantity">SEL quantity descriptor (e.g., PhaseA.Voltage.Magnitude, Frequency).</param>
-    private sealed record SelConfigRow(
+    /// <param name="SignalID">Unique signal identifier from the database.</param>
+    /// <param name="PhasorLabel">Clean phasor label from the database (line/bus name); empty for non-phasor signals.</param>
+    public sealed record SignalMapping(
         string DeviceAcronym,
         string Description,
         string MeasurementPoint,
-        string Quantity);
+        string Quantity,
+        string SignalID,
+        string PhasorLabel);
 
     /// <summary>
     /// Represents a planned update to the AlternateTag field in the database.
@@ -754,20 +769,21 @@ public static class SttpConfigExporter
     /// </exception>
     private static List<MeasurementRow> LoadActiveMeasurements(DbConnection connection)
     {
-        const string SQL = """
-                       SELECT
-                           SignalID,
-                           PointTag,
-                           AlternateTag,
-                           Device,
-                           Description,
-                           SignalType,
-                           EngineeringUnits,
-                           Phase,
-                           PhasorType,
-                           PhasorLabel
-                       FROM ActiveMeasurement
-                       """;
+        const string SQL = 
+            """
+            SELECT
+               SignalID,
+               PointTag,
+               AlternateTag,
+               Device,
+               Description,
+               SignalType,
+               EngineeringUnits,
+               Phase,
+               PhasorType,
+               PhasorLabel
+            FROM ActiveMeasurement
+            """;
 
         using DbCommand command = connection.CreateCommand();
         command.CommandText = SQL;
@@ -908,12 +924,13 @@ public static class SttpConfigExporter
     private static void PersistAlternateTagUpdates(DbConnection connection, List<AlternateTagUpdate> updates)
     {
         // Only write if AlternateTag is NULL/empty (per permanence rules).
-        const string SQL = """
-                           UPDATE Measurement
-                           SET AlternateTag = @AlternateTag
-                           WHERE SignalID = @SignalID AND
-                                 (AlternateTag IS NULL OR AlternateTag = '')
-                           """;
+        const string SQL = 
+            """
+            UPDATE Measurement
+            SET AlternateTag = @AlternateTag
+            WHERE SignalID = @SignalID AND
+                 (AlternateTag IS NULL OR AlternateTag = '')
+            """;
 
         using DbCommand command = connection.CreateCommand();
         command.CommandText = SQL;
@@ -1470,14 +1487,14 @@ public static class SttpConfigExporter
     /// adheres to the SEL-compatible format. It writes the header row followed by the data rows,
     /// encoding the file in UTF-8 without a BOM (Byte Order Mark).
     /// </remarks>
-    private static void WriteSelCSV(string path, List<SelConfigRow> rows)
+    private static void WriteSelCSV(string path, List<SignalMapping> rows)
     {
         using FileStream stream = File.Create(path);
         using StreamWriter writer = new(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
 
         writer.WriteLine("DeviceAcronym,Description,MeasurementPoint,Quantity");
 
-        foreach (SelConfigRow row in rows)
+        foreach (SignalMapping row in rows)
         {
             writer.WriteLine(string.Join(",",
                 CSVField(row.DeviceAcronym),
