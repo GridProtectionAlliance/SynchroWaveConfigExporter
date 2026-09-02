@@ -710,6 +710,8 @@ public static class PowerSystemModelExporter
             string? stationName = null;
 
             // First pass: look for DFR device names (most authoritative)
+            List<string> dfrNames = [];
+
             foreach (DeviceRecord device in group)
             {
                 if (!IsDFRDevice(device.Acronym))
@@ -717,13 +719,18 @@ public static class PowerSystemModelExporter
 
                 string? extracted = ExtractStationFromDFRAcronym(device.Acronym);
 
-                if (string.IsNullOrWhiteSpace(extracted))
-                    continue;
+                if (!string.IsNullOrWhiteSpace(extracted))
+                    dfrNames.Add(extracted);
+            }
 
-                // For DFR devices, prefer the name that appears most frequently or is longest
-                // (compound names like "MAPLE RIDGE" are better than truncated names)
-                if (stationName is null || extracted.Length > stationName.Length)
-                    stationName = extracted;
+            if (dfrNames.Count > 0)
+            {
+                // Several standalone ("flattened") DFR devices at one station carry the station name
+                // plus an element name (e.g., "MAPLE_RIDGE_NORTH", "MAPLE_RIDGE_CEDAR_JUNCTION"), so the station is
+                // the name they all share. Otherwise prefer the longest name (compound names like
+                // "MAPLE RIDGE" are better than truncated names).
+                stationName = ExtractCommonStationName(dfrNames.Distinct(StringComparer.OrdinalIgnoreCase)) ??
+                              dfrNames.MaxBy(name => name.Length);
             }
 
             // Second pass: fall back to line-terminal device names if no DFR device found
@@ -1041,6 +1048,13 @@ public static class PowerSystemModelExporter
             if (local is null || !deviceDFRLinesMap.TryGetValue(device.Acronym, out List<DFRLineInfo>? dfrLines))
                 continue;
 
+            // A standalone ("flattened") DFR device acronym can name the measured element beyond its
+            // station (e.g., "MAPLE_RIDGE_CEDAR_JUNCTION_D_EPN8" at MAPLE_RIDGE names CEDAR_JUNCTION). That element is
+            // the remote endpoint of the device's line terminal whenever the phasor label itself (often
+            // just a circuit number such as "L123") does not identify a known station.
+            string? deviceElement = ExtractElementFromDFRAcronym(device.Acronym, local);
+            string elementRemote = deviceElement is null ? string.Empty : NormalizeToID(deviceElement);
+
             foreach (DFRLineInfo dfrLine in dfrLines)
             {
                 string remote = NormalizeToID(dfrLine.LineName);
@@ -1049,6 +1063,9 @@ public static class PowerSystemModelExporter
                 // transformer lines (handled separately); neither is a line to another station.
                 if (string.IsNullOrWhiteSpace(remote) || IsBusLabel(dfrLine.LineName) || IsTransformerLabel(dfrLine.LineName))
                     continue;
+
+                if (elementRemote.Length > 0 && FindKnownStation(remote, idStationMap) is null)
+                    remote = elementRemote;
 
                 // Prefer the voltage and paired bus from the phasor graph (authoritative) over the
                 // description-derived voltage and the station/voltage bus heuristic.

@@ -17,7 +17,8 @@ The exporter connects to an existing GPA application database (e.g., openHistori
 - **Automatic Database Discovery** - Reads configuration from installed GPA service registry keys
 - **STTP Signal Mapping** - Generates `MeasurementPoint` identifiers compatible with SEL SynchroWave Operations using intelligent character reduction and naming convention parsing to meet the 16-character limit
 - **Power System Topology** - Extracts station locations, bus voltages, and transmission line connections
-- **Dash Menu Generation** - Creates hierarchical visualization folder structures
+- **Frequency Mapping** - Maps each device's frequency and dF/dt signals to every measurement point the device establishes, so every location (line, bus, or transformer terminal) carries a frequency value
+- **Dash Menu Generation** - Creates hierarchical visualization folder structures, then appends user-maintained custom menu entries so they survive every re-export
 - **Naming Convention Parsing** - Extracts station names, line names, and voltage levels from device-centic metadata
 - **Alternate Tag Management** - Optionally persists generated mappings back to the source database for consitent future runs
 
@@ -112,7 +113,8 @@ Exporting Dash Menu...
   Substation paths: 87
   Voltage level groups: 4
   Line paths (by voltage): 234
-  Total paths exported: 325
+  User-maintained entries appended: 3 (from "C:\Program Files\SynchroWaveConfigExporter\user-dash-menu.txt")
+  Total paths exported: 328
 
 Export Complete!
 
@@ -139,10 +141,12 @@ Configuration settings are stored in `defaults.ini` / `settings.ini` in the appl
 | `BusesCsvPath` | `sel-powersystemmodel_buses.csv` | Output path for buses CSV |
 | `LinesCsvPath` | `sel-powersystemmodel_lines.csv` | Output path for lines CSV |
 | `DashMenuPath` | `dash-menu.txt` | Output path for dash menu file |
+| `UserDashMenuPath` | `user-dash-menu.txt` | User-maintained dash menu text file whose entries are appended to the automated output (relative paths resolve against the application directory) |
 | `PersistAlternateTags` | `false` | Whether to write `MeasurementPoint` mappings back to the `AlternateTag` field in the database |
 | `ExcludedPrefixes` | `ETR, EES, ESI` | Comma-separated device prefixes to exclude from signal mappings |
 | `MapPowerQuantities` | `false` | Whether to include power (MW, MVAR, MVA) calculations in signal mappings |
 | `IncludeVoltageGroupedLines` | `true` | Whether to include voltage-level grouped lines in the dash menu |
+| `MapFrequencyToAllMeasurementPoints` | `true` | Whether a device's frequency and dF/dt signals are mapped to every measurement point derived from that device; when `false`, they map to a single preferred point (the device's bus-voltage point, else its first point) |
 
 ### Example Configuration File
 
@@ -169,6 +173,9 @@ IncludeVoltageGroupedLines=[bool]:True
 ; Power system model lines CSV output path
 LinesCsvPath=sel-powersystemmodel_lines.csv
 
+; Indicates whether a device's frequency and dF/dt signals are mapped to every measurement point derived from that device, otherwise only to a single preferred point
+MapFrequencyToAllMeasurementPoints=[bool]:True
+
 ; Indicates whether power quantities should be mapped to 'MeasurementPoint' mappings
 MapPowerQuantities=[bool]:False
 
@@ -180,7 +187,24 @@ StationsCsvPath=sel-powersystemmodel_stations.csv
 
 ; STTP SEL configuration CSV output path
 SttpSelConfigCsvPath=sel-sttpreader-signalmappings.csv
+
+; Path to a user-maintained dash menu text file whose entries are appended to the automated dash menu output; a relative path is resolved against the application directory
+UserDashMenuPath=user-dash-menu.txt
 ```
+
+### User-Maintained Dash Menu Entries
+
+Everything in the exported dash menu file is derived from the database and is regenerated on every run, so edits made directly to `dash-menu.txt` are lost on the next export. Custom dashboard menu items are instead maintained in a separate text file, by default `user-dash-menu.txt` next to the executable (override the location with the `UserDashMenuPath` setting). On each run the exporter writes the automated menu paths first, then appends the entries of the user-maintained file, so the final `dash-menu.txt` always combines both parts.
+
+The user-maintained file lists one menu path per line, using the same format as the automated entries:
+
+```text
+/Custom/Operations Overview
+/Custom/Operations Overview/System Frequency
+/Custom/Reports
+```
+
+When merging, surrounding whitespace is trimmed, blank lines are removed, and an entry that exactly duplicates an automated (or earlier user-maintained) entry is skipped. The file is optional: when it does not exist, the exporter notes this in its output and writes the automated entries alone.
 
 ## Customization for Different Utilities
 
@@ -254,6 +278,25 @@ public static string? ExtractStationFromDFRAcronym(string? acronym)
 **Default Pattern:** `STATION_UNITNUM_D_XXX` → extracts `STATION`
 
 **Customize for:** Your utility's DFR naming convention
+
+---
+
+```csharp
+/// <summary>
+/// Extracts the station name shared by several device-derived names as their longest common
+/// leading token sequence.
+/// </summary>
+public static string? ExtractCommonStationName(IEnumerable<string?> names)
+
+/// <summary>
+/// Extracts the element name a DFR device acronym carries beyond its station name.
+/// </summary>
+public static string? ExtractElementFromDFRAcronym(string? acronym, string? stationName)
+```
+
+**Default Logic:** Handles "flattened" standalone DFR devices (e.g., an SEL relay configured as several single devices instead of a PDC-style parent/child hierarchy) that follow `STATION_ELEMENT_D_XXX`, such as `MAPLE_RIDGE_NORTH_D_EPN8`, `MAPLE_RIDGE_CEDAR_JUNCTION_D_EPN8`, and `MAPLE_RIDGE_XFMR_1_D_EPN8` at one location. The station is the prefix all devices at the location share (`MAPLE_RIDGE`), and the element (`CEDAR_JUNCTION`) becomes the line terminal's remote endpoint when the phasor label (e.g., a circuit number like `L123`) does not name a known station.
+
+**Customize for:** How your utility names standalone multi-device DFR installations
 
 ---
 

@@ -273,6 +273,84 @@ public static class DeviceHelper
     }
 
     /// <summary>
+    /// Extracts the station name shared by several device-derived names as their longest common
+    /// leading token sequence, e.g.: ["MAPLE RIDGE CEDAR JUNCTION", "MAPLE RIDGE NORTH", "MAPLE RIDGE XFMR"] => "MAPLE RIDGE".
+    /// </summary>
+    /// <param name="names">The station name candidates (space-separated tokens) extracted from the devices at one location.</param>
+    /// <returns>The common leading tokens joined by spaces, or <c>null</c> when the names share no leading token.</returns>
+    /// <remarks>
+    /// Some DFRs (e.g., SEL relays configured as "flattened" standalone devices instead of a
+    /// PDC-style parent/child hierarchy) are represented by several devices at one station whose
+    /// acronyms follow "STATION_ELEMENT_D_XXX#", where ELEMENT names the measured line, bus or
+    /// transformer. The station name is the prefix all of those devices share.
+    /// </remarks>
+    public static string? ExtractCommonStationName(IEnumerable<string?> names)
+    {
+        string[]? common = null;
+
+        foreach (string? name in names)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                continue;
+
+            string[] tokens = name.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+            if (common is null)
+            {
+                common = tokens;
+                continue;
+            }
+
+            int length = 0;
+
+            while (length < common.Length && length < tokens.Length && common[length].Equals(tokens[length], StringComparison.OrdinalIgnoreCase))
+                length++;
+
+            common = common[..length];
+
+            if (common.Length == 0)
+                return null;
+        }
+
+        return common is { Length: > 0 } ? string.Join(' ', common) : null;
+    }
+
+    /// <summary>
+    /// Extracts the element name a DFR device acronym carries beyond its station name, e.g.: for
+    /// "MAPLE_RIDGE_CEDAR_JUNCTION_D_EPN8" at station "MAPLE RIDGE" => "CEDAR JUNCTION"; for a conventional
+    /// "MAPLE_RIDGE_2_D_EPN8" at station "MAPLE RIDGE" => <c>null</c>.
+    /// </summary>
+    /// <param name="acronym">The DFR device acronym to parse.</param>
+    /// <param name="stationName">The station name (or identifier) the device belongs to.</param>
+    /// <returns>The element name with underscores replaced by spaces, or <c>null</c> when the acronym names only the station.</returns>
+    /// <remarks>
+    /// For "flattened" standalone DFR devices, the element typically names the remote station of
+    /// the measured line terminal, so it can serve as the line's remote endpoint when the phasor
+    /// label itself (e.g., a circuit number such as "L123") does not identify one.
+    /// </remarks>
+    public static string? ExtractElementFromDFRAcronym(string? acronym, string? stationName)
+    {
+        string? extracted = ExtractStationFromDFRAcronym(acronym);
+
+        if (string.IsNullOrWhiteSpace(extracted) || string.IsNullOrWhiteSpace(stationName))
+            return null;
+
+        string[] tokens = extracted.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        string[] stationTokens = stationName.Replace('_', ' ').Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        if (tokens.Length <= stationTokens.Length)
+            return null;
+
+        for (int i = 0; i < stationTokens.Length; i++)
+        {
+            if (!tokens[i].Equals(stationTokens[i], StringComparison.OrdinalIgnoreCase))
+                return null;
+        }
+
+        return string.Join(' ', tokens[stationTokens.Length..]);
+    }
+
+    /// <summary>
     /// Extracts station name from any device acronym with underscore-separated pattern.
     /// Handles patterns like "STATION_NAME_1_Q_XXX", "STATION_P_XXX", etc.
     /// Looks for common markers (_Q_, _P_, _D_, _I_) and extracts the station prefix.

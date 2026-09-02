@@ -34,7 +34,8 @@ namespace SynchroWaveConfigExporter;
 /// groups measurements by phasor/line identity for consistent naming, and maps signal types
 /// to SEL quantity descriptors. Manages AlternateTag generation and persistence with strict
 /// permanence rules (never modifies existing tags). Supports PMU devices, multi-line substations,
-/// calculated values, and frequency measurements.
+/// calculated values, and frequency measurements (mapped to every measurement point a device
+/// establishes, so each location carries a frequency value).
 /// </remarks>
 public static class SttpConfigExporter
 {
@@ -53,8 +54,13 @@ public static class SttpConfigExporter
         ArgumentNullException.ThrowIfNull(connection);
         ArgumentException.ThrowIfNullOrWhiteSpace(Settings.SttpSelConfigCsvPath);
 
-        // 1) Load all measurements
-        List<MeasurementRow> rows = LoadActiveMeasurements(connection);
+        // 1) Load all measurements in a stable order so measurement point assignment is deterministic
+        //    from run to run, regardless of the order in which the database returns rows
+        List<MeasurementRow> rows = LoadActiveMeasurements(connection)
+            .OrderBy(row => row.Device, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(row => row.PointTag, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(row => row.SignalID, StringComparer.OrdinalIgnoreCase)
+            .ToList();
 
         // 2) Apply permanence rules + plan new AlternateTags (only when missing)
         //    Generate/persist BASE tags only (no suffixing).
@@ -88,8 +94,11 @@ public static class SttpConfigExporter
     /// Builds config rows by first grouping measurements by their phasor/line identity,
     /// then assigning consistent MeasurementPoint names to each group.
     /// Processes phasor measurements first to establish measurement points, then processes
-    /// non-phasor measurements (frequency, dF/dt, calculated values) which may share
-    /// measurement points with their associated phasors.
+    /// non-phasor measurements (frequency, dF/dt, calculated values) which share measurement
+    /// points with their associated phasors. A device's frequency and dF/dt are device-level
+    /// signals, so they are mapped onto every measurement point the device's phasors established
+    /// (or a single preferred point when <see cref="Settings.MapFrequencyToAllMeasurementPoints"/>
+    /// is disabled); they only get a point of their own when the device has no phasors.
     /// </summary>
     private static List<SignalMapping> BuildConfigRowsWithLineGrouping(List<MeasurementRow> rows, AlternateTagPlan plan)
     {
@@ -113,6 +122,10 @@ public static class SttpConfigExporter
         // Track phasor measurement points by device - used for frequency/dF/dt assignment
         // Key: device, Value: list of measurement points associated with phasors for that device
         Dictionary<string, List<string>> devicePhasorMeasurementPointsMap = new(StringComparer.OrdinalIgnoreCase);
+
+        // Measurement points whose phasor label denotes a bus - the preferred single location for
+        // a device's frequency when frequency is not mapped to every measurement point
+        HashSet<string> busMeasurementPoints = new(StringComparer.OrdinalIgnoreCase);
 
         // First pass: Process phasor measurements to establish measurement points
         // This ensures frequency/dF/dt can find existing phasor measurement points
@@ -173,6 +186,9 @@ public static class SttpConfigExporter
 
                 if (!mpList.Contains(assignedMP, StringComparer.OrdinalIgnoreCase))
                     mpList.Add(assignedMP);
+
+                if (IsBusLabel(lineName))
+                    busMeasurementPoints.Add(assignedMP);
             }
 
             // Create a composite key for MeasurementPoint + Quantity combination
@@ -209,6 +225,38 @@ public static class SttpConfigExporter
             if (quantity is null)
                 continue;
 
+            string device = row.Device ?? string.Empty;
+
+            // Frequency and dF/dt are device-level signals: a device measures one frequency that
+            // applies at every location (line, bus or transformer terminal) its phasors establish,
+            // so map them onto those measurement points. Only a device without phasor measurement
+            // points gets a frequency point of its own (handled by the general path below).
+            if (IsFrequencyType(row.SignalType))
+            {
+                List<string> frequencyPoints = FindFrequencyMeasurementPoints(device, devicePhasorMeasurementPointsMap, busMeasurementPoints);
+
+                if (frequencyPoints.Count > 0)
+                {
+                    foreach (string measurementPoint in frequencyPoints)
+                    {
+                        // Each MeasurementPoint + Quantity combination appears only once in output
+                        if (!usedCombinations.Add($"{measurementPoint}|{quantity}"))
+                            continue;
+
+                        configRows.Add(new SignalMapping(
+                            DeviceAcronym: device,
+                            Description: row.Description ?? string.Empty,
+                            MeasurementPoint: measurementPoint,
+                            Quantity: quantity,
+                            SignalID: row.SignalID,
+                            PhasorLabel: row.PhasorLabel ?? string.Empty
+                        ));
+                    }
+
+                    continue;
+                }
+            }
+
             // Get the base measurement point from AlternateTag or generated plan
             string? baseMeasurementPoint = row.AlternateTag;
 
@@ -223,7 +271,6 @@ public static class SttpConfigExporter
 
             // Determine the line group key for this measurement
             string lineGroupKey = GetLineGroupKey(row);
-            string device = row.Device ?? string.Empty;
 
             // Extract the canonical line name for lookup purposes
             string? lineName = ExtractCanonicalLineName(row);
@@ -232,12 +279,7 @@ public static class SttpConfigExporter
             // Check if we already have a MeasurementPoint for this line group
             if (!lineGroupMeasurementPointMap.TryGetValue(lineGroupKey, out string? assignedMP))
             {
-                if (IsFrequencyType(row.SignalType))
-                {
-                    // For frequency/dF/dt, try to find an existing phasor measurement point for this device
-                    assignedMP = FindPhasorMeasurementPointForDevice(device, devicePhasorMeasurementPointsMap);
-                }
-                else if (IsCalculatedValue(row) && !string.IsNullOrWhiteSpace(lineName))
+                if (IsCalculatedValue(row) && !string.IsNullOrWhiteSpace(lineName))
                 {
                     // For calculated values, try to find an existing measurement point for this line
                     assignedMP = FindExistingMeasurementPointForLine(device, lineName, deviceLineNameMeasurementPointMap);
@@ -281,33 +323,34 @@ public static class SttpConfigExporter
     }
 
     /// <summary>
-    /// Finds a phasor measurement point for a device to use for frequency/dF/dt.
-    /// Returns the first phasor measurement point if available, null otherwise.
-    /// This handles both single-line and multi-line devices by using the first encountered phasor.
+    /// Finds the measurement points a device's frequency and dF/dt signals map to: every point
+    /// established by the device's phasors when <see cref="Settings.MapFrequencyToAllMeasurementPoints"/>
+    /// is enabled, otherwise a single preferred point (the first bus-voltage point, else the first
+    /// point). Returns an empty list when the device has no phasor measurement points, in which
+    /// case the frequency signals get a device-level point of their own.
     /// </summary>
-    private static string? FindPhasorMeasurementPointForDevice(
+    /// <remarks>
+    /// A multi-terminal device (e.g., a DFR measuring many lines at one station) yields one
+    /// measurement point per terminal. Mapping its single frequency to only one of them leaves
+    /// every other location without a frequency value, and which location received it depended on
+    /// database row order. Mapping to every point gives each location its frequency deterministically.
+    /// </remarks>
+    private static List<string> FindFrequencyMeasurementPoints(
         string device,
-        Dictionary<string, List<string>> devicePhasorMeasurementPointsMap)
+        Dictionary<string, List<string>> devicePhasorMeasurementPointsMap,
+        HashSet<string> busMeasurementPoints)
     {
         if (string.IsNullOrWhiteSpace(device))
-            return null;
+            return [];
 
-        if (!devicePhasorMeasurementPointsMap.TryGetValue(device, out List<string>? mpList))
-            return null;
+        if (!devicePhasorMeasurementPointsMap.TryGetValue(device, out List<string>? mpList) || mpList.Count == 0)
+            return [];
 
-        // If there's exactly one phasor measurement point for this device, use it
-        // If there are multiple, we can't determine which one to use, so return null
-        // (frequency will get its own measurement point)
-        if (mpList.Count == 1)
-            return mpList[0];
+        if (Settings.MapFrequencyToAllMeasurementPoints)
+            return mpList;
 
-        // Multiple phasor groups - could pick the first one, but that might be arbitrary
-        // For now, if there are multiple, use the first one encountered
-        // This handles cases like MESA_SOLAR where there's effectively one line
-        if (mpList.Count > 0)
-            return mpList[0];
-
-        return null;
+        // A device measures one frequency: its bus-voltage point is the natural single location
+        return [mpList.FirstOrDefault(busMeasurementPoints.Contains) ?? mpList[0]];
     }
 
     /// <summary>
@@ -393,9 +436,8 @@ public static class SttpConfigExporter
             return $"{device}|PHASOR|{baseLineName}";
         }
 
-        // For frequency/dfdt, try to find a matching phasor group for this device
-        // This will be resolved later in BuildConfigRowsWithLineGrouping by checking
-        // if there's a single phasor group for this device
+        // For frequency/dF/dt, group by device. BuildConfigRowsWithLineGrouping maps these onto the
+        // device's phasor measurement points; this key is only used when the device has none.
         if (IsFrequencyType(row.SignalType))
             return $"{device}|FREQ";
 
@@ -1307,7 +1349,8 @@ public static class SttpConfigExporter
         string? phase = NormalizePhase(row.Phase);
         string desc = row.Description ?? string.Empty;
 
-        // If phase is null for phasor types, check description for hints
+        // If phase is null for phasor types, check description for hints. Sequence numbering must
+        // agree with NormalizePhase and SEL's convention: 0 = zero, 1 = positive, 2 = negative.
         if (string.IsNullOrWhiteSpace(phase))
         {
             if (Contains(desc, " A ") || Contains(desc, "_A_") || Contains(desc, "_A-"))
@@ -1318,9 +1361,9 @@ public static class SttpConfigExporter
                 phase = "C";
             else if (Contains(desc, " 0 ") || Contains(desc, "_0_") || Contains(desc, "_0-") || Contains(desc, "ZERO"))
                 phase = "0";
-            else if (Contains(desc, " - ") || Contains(desc, "_-_") || Contains(desc, "_--") || Contains(desc, "NEG"))
-                phase = "1";
             else if (Contains(desc, " + ") || Contains(desc, "_+_") || Contains(desc, "_+-") || Contains(desc, "POS"))
+                phase = "1";
+            else if (Contains(desc, " - ") || Contains(desc, "_-_") || Contains(desc, "_--") || Contains(desc, "NEG"))
                 phase = "2";
         }
 

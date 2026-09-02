@@ -1,7 +1,7 @@
 //******************************************************************************************************
 //  DashMenuExporter.cs - Gbtc
 //
-//  Copyright © 2026, Grid Protection Alliance.  All Rights Reserved.
+//  Copyright Â© 2026, Grid Protection Alliance.  All Rights Reserved.
 //
 //  Licensed to the Grid Protection Alliance (GPA) under one or more contributor license agreements. See
 //  the NOTICE file distributed with this work for additional information regarding copyright ownership.
@@ -38,19 +38,27 @@ namespace SynchroWaveConfigExporter;
 ///   <item>/Templates/Assets/Substations/{StationId} - One entry per station</item>
 ///   <item>/Templates/Assets/{kV} kV Lines/{LineId} - Lines grouped by voltage level</item>
 /// </list>
+/// <para>
+/// The automated entries are fully derived from the database. Custom dashboard menu items that
+/// must survive re-exports are maintained by the user in a separate text file (see
+/// <see cref="Settings.UserDashMenuPath"/>) whose entries are appended to the automated output,
+/// so the final file combines both parts with blank lines and exact duplicates removed.
+/// </para>
 /// </remarks>
 public static class DashMenuExporter
 {
     // ========= Public API =========
 
     /// <summary>
-    /// Exports a dash menu file containing hierarchical folder paths for stations and lines.
+    /// Exports a dash menu file containing hierarchical folder paths for stations and lines,
+    /// followed by any user-maintained dash menu entries.
     /// </summary>
     /// <returns>Result containing export statistics including counts of paths generated.</returns>
     /// <exception cref="ArgumentException">Thrown when DashMenuPath setting is null or whitespace.</exception>
     /// <remarks>
     /// This method reads the previously exported power system model CSV files (stations, buses, lines)
-    /// and generates a hierarchical dash menu file for dashboard navigation.
+    /// and generates a hierarchical dash menu file for dashboard navigation, then appends the entries
+    /// of the user-maintained dash menu file when one exists.
     /// </remarks>
     public static DashMenuExportResult Export()
     {
@@ -109,6 +117,23 @@ public static class DashMenuExporter
             }
         }
 
+        // Append the user-maintained entries (custom menu items not derived from the database) so the
+        // final file combines the automated part with the user-maintained part. Blank lines were
+        // dropped on load; exact duplicates of automated (or earlier user) entries are skipped.
+        (string userDashMenuPath, bool userDashMenuFound, List<string> userPaths) = LoadUserDashMenuEntries();
+
+        HashSet<string> seenPaths = new(paths, StringComparer.Ordinal);
+        int userPathsAppended = 0;
+
+        foreach (string userPath in userPaths)
+        {
+            if (!seenPaths.Add(userPath))
+                continue;
+
+            paths.Add(userPath);
+            userPathsAppended++;
+        }
+
         // Write the dash menu file (paths list maintains insertion order)
         WriteDashMenuFile(Settings.DashMenuPath, paths);
 
@@ -120,7 +145,10 @@ public static class DashMenuExporter
             StationsLoaded: stations.Count,
             BusesLoaded: buses.Count,
             LinesLoaded: lines.Count,
-            OutputPath: Settings.DashMenuPath
+            OutputPath: Settings.DashMenuPath,
+            UserDashMenuPath: userDashMenuPath,
+            UserDashMenuFound: userDashMenuFound,
+            UserPathsAppended: userPathsAppended
         );
     }
 
@@ -137,6 +165,9 @@ public static class DashMenuExporter
     /// <param name="BusesLoaded">The number of buses loaded from the CSV file.</param>
     /// <param name="LinesLoaded">The number of lines loaded from the CSV file.</param>
     /// <param name="OutputPath">The file path where the dash menu file was written.</param>
+    /// <param name="UserDashMenuPath">The resolved path of the user-maintained dash menu file (empty when not configured).</param>
+    /// <param name="UserDashMenuFound">Whether the user-maintained dash menu file exists.</param>
+    /// <param name="UserPathsAppended">The number of user-maintained entries appended to the automated output.</param>
     public sealed record DashMenuExportResult(
         int TotalPaths,
         int SubstationPaths,
@@ -145,7 +176,10 @@ public static class DashMenuExporter
         int StationsLoaded,
         int BusesLoaded,
         int LinesLoaded,
-        string OutputPath);
+        string OutputPath,
+        string UserDashMenuPath,
+        bool UserDashMenuFound,
+        int UserPathsAppended);
 
     // ========= Data Models =========
 
@@ -298,6 +332,40 @@ public static class DashMenuExporter
         return lines;
     }
 
+    // ========= User-Maintained Entries =========
+
+    /// <summary>
+    /// Loads the user-maintained dash menu entries, one path per line, from the file configured by
+    /// <see cref="Settings.UserDashMenuPath"/>. A relative path resolves against the application
+    /// directory (where the executable and settings files live), not the current working directory.
+    /// Blank lines are dropped and surrounding whitespace is trimmed.
+    /// </summary>
+    /// <returns>The resolved file path, whether the file exists, and its non-blank entries in file order.</returns>
+    private static (string Path, bool Found, List<string> Entries) LoadUserDashMenuEntries()
+    {
+        string configuredPath = Settings.UserDashMenuPath;
+
+        if (string.IsNullOrWhiteSpace(configuredPath))
+            return (string.Empty, false, []);
+
+        string path = FilePath.GetAbsolutePath(configuredPath);
+
+        if (!File.Exists(path))
+            return (path, false, []);
+
+        List<string> entries = [];
+
+        foreach (string rawLine in File.ReadLines(path))
+        {
+            string line = rawLine.Trim();
+
+            if (line.Length > 0)
+                entries.Add(line);
+        }
+
+        return (path, true, entries);
+    }
+
     // ========= CSV Parsing =========
 
     /// <summary>
@@ -334,7 +402,7 @@ public static class DashMenuExporter
     // ========= File Writing =========
 
     /// <summary>
-    /// Writes the dash menu paths to a text file.
+    /// Writes the dash menu paths to a text file, one per line, never emitting a blank line.
     /// </summary>
     private static void WriteDashMenuFile(string path, List<string> paths)
     {
@@ -342,6 +410,9 @@ public static class DashMenuExporter
         using StreamWriter writer = new(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
 
         foreach (string menuPath in paths)
-            writer.WriteLine(menuPath);
+        {
+            if (!string.IsNullOrWhiteSpace(menuPath))
+                writer.WriteLine(menuPath);
+        }
     }
 }

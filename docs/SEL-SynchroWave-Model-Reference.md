@@ -78,6 +78,17 @@ voltage + current, magnitude + angle, frequency, power, availability. In the exp
 ignored. This is the STTP Reader's job: map each incoming `DeviceAcronym`/`Description`
 (auto-filled from the STTP stream's Station+Tag) to an `MP` + `Quantity`.
 
+### Frequency is a device-level signal
+A device measures one frequency (and one dF/dt), but a multi-terminal device (a DFR with
+many phasor labels) yields one MP per terminal. Since the MP is the *location* SEL
+associates with a Line/Bus asset, a frequency mapped to only one of those MPs leaves every
+other location without a frequency value — and which location received it would depend on
+database row order. The exporter therefore maps a device's `Frequency` and
+`Frequency.DxDt` onto **every** MP its phasors established (one CSV row per MP, all naming
+the same source signal); the `MapFrequencyToAllMeasurementPoints` setting falls back to a
+single preferred point (the device's bus-voltage MP, else its first MP) if a deployment
+requires one row per source signal. A device with no phasor MPs gets a device-level MP.
+
 > **Implication for naming:** the `MeasurementPoint` value used in the signal mappings is
 > the *same string* later referenced as `FromTerminalMP`/`ToTerminalMP` in `lines.csv`.
 > The model files do not invent MPs — they **reference** the MPs minted by the signal
@@ -206,6 +217,18 @@ Each distinct `Label` is a separate terminal/line off the station, at its own kV
 station can have both a 500 and 230 bus). I-phasors again carry `DestinationPhasorID` →
 V-phasor.
 
+**"Flattened" DFR device** — one physical DFR represented as several standalone devices
+(no PDC-style parent/child hierarchy), one per measured element, all at the same GPS:
+```
+Acronym: STATION_ELEMENT_D_<id>   @ STATION      e.g. STATION_NORTH, STATION_REMOTE_A, STATION_XFMR_1
+  Label=BUS (V)  |  Label=L123 (V/I)  |  Label=XFMR_1 (V/I)   — one label per device
+```
+Here the acronym carries the station **and** the element. The station is the token prefix
+every device at the location shares (`ExtractCommonStationName`), and the element
+(`ExtractElementFromDFRAcronym`) names the terminal's remote endpoint whenever the phasor
+label (often just a circuit number) does not resolve to a known station. No device-specific
+code is needed: a conventional `STATION_<n>_D_<id>` group reduces to the same station name.
+
 ### Structural facts the derivation relies on
 1. **Most lines are measured at only one end.** In typical PMU/DFR deployments the large
    majority of lines are instrumented at a single terminal; only a minority are genuinely
@@ -301,7 +324,8 @@ free-text description parsing.
    the `id → PhasorRecord` map for `DestinationPhasorID` resolution.
 2. `BuildTerminalsAndDFRLines` — from the signal mappings, pick each device's **terminal
    MP** and extract DFR line names from the phasor labels.
-3. `DeriveStations` — group devices by GPS (rounded), extract a station name, nominal
+3. `DeriveStations` — group devices by GPS (rounded), extract a station name (for DFR
+   devices, the name their acronyms share — see the flattened DFR form above), nominal
    kV = max resolved kV. Devices/groups with no name or no resolvable voltage are skipped
    and **named** in the run report.
 4. `CollectBusMeasurementPoints` + `BuildCanonicalBusMap` — gather bus-voltage MPs and, where
@@ -311,7 +335,8 @@ free-text description parsing.
    otherwise notional).
 6. `DeriveLines` — the measured-terminal model above for PMU devices, DFR labels, and
    transformers (`DeriveTransformerLines`); pairs each terminal MP with its own bus via
-   `EnsureBus`/`EnsureNamedBus`/`ResolveTerminalBus`, matches remotes via `FindKnownStation`,
+   `EnsureBus`/`EnsureNamedBus`/`ResolveTerminalBus`, matches remotes via `FindKnownStation`
+   (a flattened DFR device's acronym element stands in for a label that names no station),
    and dedupes by MP.
 7. `AddBusMeasurementPointRows` + `PruneUnreferencedNotionalBuses` — emit a bus per bus-MP,
    then drop notional buses left unreferenced once lines bind to their specific measured

@@ -64,6 +64,12 @@ public static class Settings
     public static string DashMenuPath => s_section.DashMenuPath;
 
     /// <summary>
+    /// Gets path to the user-maintained dash menu text file whose entries are appended to the
+    /// automated dash menu output. A relative path is resolved against the application directory.
+    /// </summary>
+    public static string UserDashMenuPath => s_section.UserDashMenuPath;
+
+    /// <summary>
     /// Gets value indicating whether 'MeasurementPoint' mappings should be persisted to 'AlternateTag' field.
     /// </summary>
     public static bool PersistAlternateTags => s_section.PersistAlternateTags;
@@ -82,6 +88,12 @@ public static class Settings
     /// Gets a value indicating whether to include voltage-level grouped lines in the dash menu.
     /// </summary>
     public static bool IncludeVoltageGroupedLines => s_section.IncludeVoltageGroupedLines;
+
+    /// <summary>
+    /// Gets a value indicating whether a device's frequency and dF/dt signals are mapped to every
+    /// measurement point derived from that device; otherwise, they are mapped to a single preferred point.
+    /// </summary>
+    public static bool MapFrequencyToAllMeasurementPoints => s_section.MapFrequencyToAllMeasurementPoints;
 
     /// <summary>
     /// Gets a clean version of the given value by removing characters that are
@@ -109,9 +121,11 @@ public static class Settings
         s_section.BusesCsvPath = ("sel-powersystemmodel_buses.csv", "Power system model buses CSV output path");
         s_section.LinesCsvPath = ("sel-powersystemmodel_lines.csv", "Power system model lines CSV output path");
         s_section.DashMenuPath = ("dash-menu.txt", "Dash menu file output path");
+        s_section.UserDashMenuPath = ("user-dash-menu.txt", "Path to a user-maintained dash menu text file whose entries are appended to the automated dash menu output; a relative path is resolved against the application directory");
         s_section.PersistAlternateTags = (false, "Indicates whether 'MeasurementPoint' mappings should be persisted to 'AlternateTag' field");
         s_section.ExcludedPrefixes = (new[] {"ETR", "EES", "ESI"}, "Other prefixes to be excluded from 'MeasurementPoint' mappings");
         s_section.MapPowerQuantities = (false, "Indicates whether power quantities should be mapped to 'MeasurementPoint' mappings");
         s_section.IncludeVoltageGroupedLines = (true, "Indicates whether to include voltage-level grouped lines in the dash menu");
+        s_section.MapFrequencyToAllMeasurementPoints = (true, "Indicates whether a device's frequency and dF/dt signals are mapped to every measurement point derived from that device, otherwise only to a single preferred point");
     }
 }

@@ -288,7 +288,12 @@ internal class Program
                 Console.WriteLine($"  Voltage level groups: {dashMenuResult.VoltageLevelGroups:N0}");
                 Console.WriteLine($"  Line paths (by voltage): {dashMenuResult.LinePaths:N0}");
             }
-            
+
+            if (dashMenuResult.UserDashMenuFound)
+                Console.WriteLine($"  User-maintained entries appended: {dashMenuResult.UserPathsAppended:N0} (from \"{dashMenuResult.UserDashMenuPath}\")");
+            else if (!string.IsNullOrWhiteSpace(dashMenuResult.UserDashMenuPath))
+                Console.WriteLine($"  User-maintained entries appended: 0 (optional file not found: \"{dashMenuResult.UserDashMenuPath}\")");
+
             Console.WriteLine($"  Total paths exported: {dashMenuResult.TotalPaths:N0}");
             Console.WriteLine();
 
