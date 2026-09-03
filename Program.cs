@@ -81,6 +81,12 @@ internal class Program
 
         connectionString = connectionSettings.JoinKeyValuePairs();
 
+        // Remember where the configuration came from so the run report can show it - an export
+        // that reads an unexpected database (e.g., another install found via the registry) is the
+        // first thing to rule out when devices are missing from the output
+        s_configFilePath = configFilePath;
+        s_dataSourceDescription = DescribeDataSource(connectionSettings);
+
         string? dataProviderString = serviceConfig
             .Descendants("systemSettings")
             .SelectMany(systemSettings => systemSettings.Elements("add"))
@@ -92,6 +98,35 @@ internal class Program
 
         // Open database
         return new AdoDataConnection(connectionString, GetCoreDataProviderString(dataProviderString));
+    }
+
+    private static string s_configFilePath = string.Empty;
+    private static string s_dataSourceDescription = string.Empty;
+
+    /// <summary>
+    /// Describes the database a connection string points at (server and catalog, or file path)
+    /// without exposing any credentials.
+    /// </summary>
+    private static string DescribeDataSource(Dictionary<string, string> connectionSettings)
+    {
+        string Get(params string[] keys)
+        {
+            foreach (string key in keys)
+            {
+                if (connectionSettings.TryGetValue(key, out string? value) && !string.IsNullOrWhiteSpace(value))
+                    return value.Trim();
+            }
+
+            return string.Empty;
+        }
+
+        string dataSource = Get("Data Source", "Server", "Address", "Addr", "Network Address");
+        string catalog = Get("Initial Catalog", "Database");
+
+        if (dataSource.Length == 0 && catalog.Length == 0)
+            return "(data source not specified)";
+
+        return catalog.Length == 0 ? dataSource : $"{dataSource}, database \"{catalog}\"";
     }
 
     private static string GetCompanyAcronym()
@@ -146,7 +181,9 @@ internal class Program
         {
             using AdoDataConnection database = OpenConnection();
 
-            Console.WriteLine($"Connected to database: {Settings.HostService}");
+            Console.WriteLine($"Connected to database: {Settings.HostService} @ {s_dataSourceDescription}");
+            Console.WriteLine($"  Configuration file: {s_configFilePath}");
+            Console.WriteLine($"  Company acronym: {GetCompanyAcronym()}");
             Console.WriteLine();
 
             // Export SEL STTP signal mappings
