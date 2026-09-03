@@ -157,6 +157,24 @@ internal class Program
             Console.WriteLine($"  Measurements exported: {configResult.Exported:N0}");
             Console.WriteLine($"  Alternate tags generated: {configResult.AlternateTagsGenerated:N0}");
             Console.WriteLine($"  Invalid alternate tags (too long): {configResult.InvalidAlternateTagTooLong:N0}");
+
+            SttpConfigExporter.FrequencyMappingStats frequencyMapping = configResult.FrequencyMapping;
+            Console.WriteLine($"  Frequency mapped to bus point: {frequencyMapping.DevicesOnBusPoint:N0} device(s); single-point devices: {frequencyMapping.DevicesSinglePoint:N0}; own point (no phasors): {frequencyMapping.DevicesOnOwnPoint:N0}");
+
+            if (frequencyMapping.DevicesOnFirstOfMany > 0)
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"  Multi-point devices with no bus point (frequency mapped to first point): {frequencyMapping.DevicesOnFirstOfMany:N0}");
+
+                foreach (string detail in frequencyMapping.FirstOfManyDetails.Take(20))
+                    Console.WriteLine($"    - {detail}");
+
+                if (frequencyMapping.FirstOfManyDetails.Count > 20)
+                    Console.WriteLine($"    ... and {frequencyMapping.FirstOfManyDetails.Count - 20:N0} more");
+
+                Console.ResetColor();
+            }
+
             Console.WriteLine();
 
             // Export power system model (stations, buses, lines)

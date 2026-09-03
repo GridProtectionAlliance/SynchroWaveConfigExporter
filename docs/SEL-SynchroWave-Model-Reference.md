@@ -80,14 +80,15 @@ ignored. This is the STTP Reader's job: map each incoming `DeviceAcronym`/`Descr
 
 ### Frequency is a device-level signal
 A device measures one frequency (and one dF/dt), but a multi-terminal device (a DFR with
-many phasor labels) yields one MP per terminal. Since the MP is the *location* SEL
-associates with a Line/Bus asset, a frequency mapped to only one of those MPs leaves every
-other location without a frequency value — and which location received it would depend on
-database row order. The exporter therefore maps a device's `Frequency` and
-`Frequency.DxDt` onto **every** MP its phasors established (one CSV row per MP, all naming
-the same source signal); the `MapFrequencyToAllMeasurementPoints` setting falls back to a
-single preferred point (the device's bus-voltage MP, else its first MP) if a deployment
-requires one row per source signal. A device with no phasor MPs gets a device-level MP.
+many phasor labels) yields one MP per terminal. **SynchroWave allows each source signal to
+appear only once in the mapping file** (confirmed with SEL), so the frequency cannot be
+repeated on every MP. The exporter maps a device's `Frequency` and `Frequency.DxDt` onto
+its **bus-voltage MP** — the point the frequency is derived from — deterministically (rows are
+sorted, so the choice no longer depends on database row order); a device without a bus MP
+uses its first MP, and a device with no phasor MPs gets a device-level MP. The run report
+counts devices in each case so a missing bus point is visible. The
+`MapFrequencyToAllMeasurementPoints` setting (default off) exists only for experimentation;
+enabling it produces a file SynchroWave rejects.
 
 > **Implication for naming:** the `MeasurementPoint` value used in the signal mappings is
 > the *same string* later referenced as `FromTerminalMP`/`ToTerminalMP` in `lines.csv`.

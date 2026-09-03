@@ -34,8 +34,8 @@ namespace SynchroWaveConfigExporter;
 /// groups measurements by phasor/line identity for consistent naming, and maps signal types
 /// to SEL quantity descriptors. Manages AlternateTag generation and persistence with strict
 /// permanence rules (never modifies existing tags). Supports PMU devices, multi-line substations,
-/// calculated values, and frequency measurements (mapped to every measurement point a device
-/// establishes, so each location carries a frequency value).
+/// calculated values, and frequency measurements (mapped to the device's bus-voltage measurement
+/// point, since SynchroWave allows each source signal to appear only once).
 /// </remarks>
 public static class SttpConfigExporter
 {
@@ -71,7 +71,7 @@ public static class SttpConfigExporter
             PersistAlternateTagUpdates(connection, plan.Updates);
 
         // 4) Build config rows using phasor/line grouping for consistent MeasurementPoint assignment
-        List<SignalMapping> configRows = BuildConfigRowsWithLineGrouping(rows, plan);
+        (List<SignalMapping> configRows, FrequencyMappingStats frequencyMapping) = BuildConfigRowsWithLineGrouping(rows, plan);
 
         // 5) Write output CSV
         WriteSelCSV(Settings.SttpSelConfigCsvPath, configRows);
@@ -82,7 +82,8 @@ public static class SttpConfigExporter
             TotalLoaded: rows.Count,
             Exported: configRows.Count,
             InvalidAlternateTagTooLong: plan.InvalidForExportSignalIDs.Count,
-            AlternateTagsGenerated: plan.Updates.Count
+            AlternateTagsGenerated: plan.Updates.Count,
+            FrequencyMapping: frequencyMapping
         );
 
         return (result, configRows);
@@ -96,13 +97,20 @@ public static class SttpConfigExporter
     /// Processes phasor measurements first to establish measurement points, then processes
     /// non-phasor measurements (frequency, dF/dt, calculated values) which share measurement
     /// points with their associated phasors. A device's frequency and dF/dt are device-level
-    /// signals, so they are mapped onto every measurement point the device's phasors established
-    /// (or a single preferred point when <see cref="Settings.MapFrequencyToAllMeasurementPoints"/>
-    /// is disabled); they only get a point of their own when the device has no phasors.
+    /// signals, so they are mapped onto the device's bus-voltage measurement point (else its first
+    /// point), or onto every point it established when
+    /// <see cref="Settings.MapFrequencyToAllMeasurementPoints"/> is enabled; they only get a point
+    /// of their own when the device has no phasors.
     /// </summary>
-    private static List<SignalMapping> BuildConfigRowsWithLineGrouping(List<MeasurementRow> rows, AlternateTagPlan plan)
+    /// <returns>The config rows and a per-device summary of where frequency signals were mapped.</returns>
+    private static (List<SignalMapping> Rows, FrequencyMappingStats FrequencyMapping) BuildConfigRowsWithLineGrouping(List<MeasurementRow> rows, AlternateTagPlan plan)
     {
         List<SignalMapping> configRows = [];
+
+        // Per-device tally of where the Frequency signal landed (reported to help confirm that
+        // every multi-terminal device has a bus point for its frequency)
+        int frequencyOnBusPoint = 0, frequencySinglePoint = 0, frequencyOnFirstOfMany = 0, frequencyOnOwnPoint = 0;
+        List<string> frequencyFirstOfManyDetails = [];
 
         // Track used measurement point + quantity combinations (case-insensitive)
         // Ensures each MeasurementPoint + Quantity pair appears only once in output
@@ -227,16 +235,38 @@ public static class SttpConfigExporter
 
             string device = row.Device ?? string.Empty;
 
-            // Frequency and dF/dt are device-level signals: a device measures one frequency that
-            // applies at every location (line, bus or transformer terminal) its phasors establish,
-            // so map them onto those measurement points. Only a device without phasor measurement
-            // points gets a frequency point of its own (handled by the general path below).
+            // Frequency and dF/dt are device-level signals: a device measures one frequency, normally
+            // derived from its bus voltage, so map them onto the device's bus-voltage measurement
+            // point (SynchroWave allows each source signal only once in the mapping file). Only a
+            // device without phasor measurement points gets a frequency point of its own (handled
+            // by the general path below).
             if (IsFrequencyType(row.SignalType))
             {
                 List<string> frequencyPoints = FindFrequencyMeasurementPoints(device, devicePhasorMeasurementPointsMap, busMeasurementPoints);
 
+                bool isFrequency = quantity == "Frequency";
+
                 if (frequencyPoints.Count > 0)
                 {
+                    if (isFrequency)
+                    {
+                        int devicePointCount = devicePhasorMeasurementPointsMap[device].Count;
+
+                        if (busMeasurementPoints.Contains(frequencyPoints[0]))
+                        {
+                            frequencyOnBusPoint++;
+                        }
+                        else if (devicePointCount == 1)
+                        {
+                            frequencySinglePoint++;
+                        }
+                        else
+                        {
+                            frequencyOnFirstOfMany++;
+                            frequencyFirstOfManyDetails.Add($"{device} -> {frequencyPoints[0]} (first of {devicePointCount} points)");
+                        }
+                    }
+
                     foreach (string measurementPoint in frequencyPoints)
                     {
                         // Each MeasurementPoint + Quantity combination appears only once in output
@@ -255,6 +285,9 @@ public static class SttpConfigExporter
 
                     continue;
                 }
+
+                if (isFrequency)
+                    frequencyOnOwnPoint++;
             }
 
             // Get the base measurement point from AlternateTag or generated plan
@@ -319,21 +352,21 @@ public static class SttpConfigExporter
             ));
         }
 
-        return configRows;
+        return (configRows, new FrequencyMappingStats(frequencyOnBusPoint, frequencySinglePoint, frequencyOnFirstOfMany, frequencyOnOwnPoint, frequencyFirstOfManyDetails));
     }
 
     /// <summary>
-    /// Finds the measurement points a device's frequency and dF/dt signals map to: every point
-    /// established by the device's phasors when <see cref="Settings.MapFrequencyToAllMeasurementPoints"/>
-    /// is enabled, otherwise a single preferred point (the first bus-voltage point, else the first
-    /// point). Returns an empty list when the device has no phasor measurement points, in which
-    /// case the frequency signals get a device-level point of their own.
+    /// Finds the measurement points a device's frequency and dF/dt signals map to: the device's
+    /// first bus-voltage point (else its first point), or every point established by the device's
+    /// phasors when <see cref="Settings.MapFrequencyToAllMeasurementPoints"/> is enabled. Returns an
+    /// empty list when the device has no phasor measurement points, in which case the frequency
+    /// signals get a device-level point of their own.
     /// </summary>
     /// <remarks>
     /// A multi-terminal device (e.g., a DFR measuring many lines at one station) yields one
-    /// measurement point per terminal. Mapping its single frequency to only one of them leaves
-    /// every other location without a frequency value, and which location received it depended on
-    /// database row order. Mapping to every point gives each location its frequency deterministically.
+    /// measurement point per terminal, but SynchroWave allows each source signal to appear only once
+    /// in the mapping file, so its single frequency goes to the bus point where it is derived. The
+    /// choice is deterministic (rows are sorted) rather than dependent on database row order.
     /// </remarks>
     private static List<string> FindFrequencyMeasurementPoints(
         string device,
@@ -709,11 +742,30 @@ public static class SttpConfigExporter
     /// <param name="Exported">Number of measurements successfully exported to CSV.</param>
     /// <param name="InvalidAlternateTagTooLong">Number of measurements with AlternateTag exceeding 16 characters (invalid for SEL export).</param>
     /// <param name="AlternateTagsGenerated">Number of new AlternateTag values generated and persisted to database.</param>
+    /// <param name="FrequencyMapping">Per-device summary of where frequency signals were mapped.</param>
     public sealed record ConfigExportResult(
         int TotalLoaded,
         int Exported,
         int InvalidAlternateTagTooLong,
-        int AlternateTagsGenerated);
+        int AlternateTagsGenerated,
+        FrequencyMappingStats FrequencyMapping);
+
+    /// <summary>
+    /// Per-device summary of where the Frequency (and dF/dt) signal was mapped. SynchroWave allows
+    /// each source signal only once in the mapping file, so a device's frequency lands on exactly
+    /// one measurement point; ideally its bus-voltage point, where the frequency is derived.
+    /// </summary>
+    /// <param name="DevicesOnBusPoint">Devices whose frequency mapped to one of their bus-voltage measurement points.</param>
+    /// <param name="DevicesSinglePoint">Devices with exactly one (non-bus) measurement point, e.g., line-terminal PMUs, so the location is unambiguous.</param>
+    /// <param name="DevicesOnFirstOfMany">Multi-point devices with no bus-voltage point, whose frequency mapped to their first measurement point; worth reviewing.</param>
+    /// <param name="DevicesOnOwnPoint">Devices with no phasor measurement points, whose frequency received a device-level point of its own.</param>
+    /// <param name="FirstOfManyDetails">"device -> measurement point" entries for <see cref="DevicesOnFirstOfMany"/>.</param>
+    public sealed record FrequencyMappingStats(
+        int DevicesOnBusPoint,
+        int DevicesSinglePoint,
+        int DevicesOnFirstOfMany,
+        int DevicesOnOwnPoint,
+        List<string> FirstOfManyDetails);
 
     // ========= Data model =========
 

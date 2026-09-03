@@ -91,8 +91,13 @@ public static class Settings
 
     /// <summary>
     /// Gets a value indicating whether a device's frequency and dF/dt signals are mapped to every
-    /// measurement point derived from that device; otherwise, they are mapped to a single preferred point.
+    /// measurement point derived from that device; otherwise (the default), they are mapped to a
+    /// single point: the device's bus-voltage point when it has one, else its first point.
     /// </summary>
+    /// <remarks>
+    /// SynchroWave allows a source signal to appear only once in the signal mapping file, so the
+    /// default is <c>false</c>; enabling this produces a mapping file SynchroWave rejects.
+    /// </remarks>
     public static bool MapFrequencyToAllMeasurementPoints => s_section.MapFrequencyToAllMeasurementPoints;
 
     /// <summary>
@@ -126,6 +131,6 @@ public static class Settings
         s_section.ExcludedPrefixes = (new[] {"ETR", "EES", "ESI"}, "Other prefixes to be excluded from 'MeasurementPoint' mappings");
         s_section.MapPowerQuantities = (false, "Indicates whether power quantities should be mapped to 'MeasurementPoint' mappings");
         s_section.IncludeVoltageGroupedLines = (true, "Indicates whether to include voltage-level grouped lines in the dash menu");
-        s_section.MapFrequencyToAllMeasurementPoints = (true, "Indicates whether a device's frequency and dF/dt signals are mapped to every measurement point derived from that device, otherwise only to a single preferred point");
+        s_section.MapFrequencyToAllMeasurementPoints = (false, "Indicates whether a device's frequency and dF/dt signals are mapped to every measurement point derived from that device instead of only its bus-voltage point (else first point); leave false - SynchroWave allows each source signal to appear only once in the mapping file");
     }
 }

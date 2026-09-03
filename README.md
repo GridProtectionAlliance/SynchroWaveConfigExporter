@@ -17,7 +17,7 @@ The exporter connects to an existing GPA application database (e.g., openHistori
 - **Automatic Database Discovery** - Reads configuration from installed GPA service registry keys
 - **STTP Signal Mapping** - Generates `MeasurementPoint` identifiers compatible with SEL SynchroWave Operations using intelligent character reduction and naming convention parsing to meet the 16-character limit
 - **Power System Topology** - Extracts station locations, bus voltages, and transmission line connections
-- **Frequency Mapping** - Maps each device's frequency and dF/dt signals to every measurement point the device establishes, so every location (line, bus, or transformer terminal) carries a frequency value
+- **Frequency Mapping** - Maps each device's frequency and dF/dt signals to the device's bus-voltage measurement point (where frequency is derived), deterministically, since SynchroWave allows each source signal to appear only once in the mapping file
 - **Dash Menu Generation** - Creates hierarchical visualization folder structures, then appends user-maintained custom menu entries so they survive every re-export
 - **Naming Convention Parsing** - Extracts station names, line names, and voltage levels from device-centic metadata
 - **Alternate Tag Management** - Optionally persists generated mappings back to the source database for consitent future runs
@@ -94,6 +94,7 @@ Exporting SEL STTP Signal Mappings...
   Measurements exported: 42,567
   Alternate tags generated: 42,567
   Invalid alternate tags (too long): 23
+  Frequency mapped to bus point: 45 device(s); single-point devices: 153; own point (no phasors): 0
 
 Exporting Power System Model...
   Total devices analyzed: 234
@@ -146,7 +147,7 @@ Configuration settings are stored in `defaults.ini` / `settings.ini` in the appl
 | `ExcludedPrefixes` | `ETR, EES, ESI` | Comma-separated device prefixes to exclude from signal mappings |
 | `MapPowerQuantities` | `false` | Whether to include power (MW, MVAR, MVA) calculations in signal mappings |
 | `IncludeVoltageGroupedLines` | `true` | Whether to include voltage-level grouped lines in the dash menu |
-| `MapFrequencyToAllMeasurementPoints` | `true` | Whether a device's frequency and dF/dt signals are mapped to every measurement point derived from that device; when `false`, they map to a single preferred point (the device's bus-voltage point, else its first point) |
+| `MapFrequencyToAllMeasurementPoints` | `false` | Whether a device's frequency and dF/dt signals are mapped to every measurement point derived from that device instead of only its bus-voltage point (else its first point). Leave `false`: SynchroWave allows each source signal to appear only once in the mapping file |
 
 ### Example Configuration File
 
@@ -173,8 +174,8 @@ IncludeVoltageGroupedLines=[bool]:True
 ; Power system model lines CSV output path
 LinesCsvPath=sel-powersystemmodel_lines.csv
 
-; Indicates whether a device's frequency and dF/dt signals are mapped to every measurement point derived from that device, otherwise only to a single preferred point
-MapFrequencyToAllMeasurementPoints=[bool]:True
+; Indicates whether a device's frequency and dF/dt signals are mapped to every measurement point derived from that device instead of only its bus-voltage point (else first point); leave false - SynchroWave allows each source signal to appear only once in the mapping file
+MapFrequencyToAllMeasurementPoints=[bool]:False
 
 ; Indicates whether power quantities should be mapped to 'MeasurementPoint' mappings
 MapPowerQuantities=[bool]:False
