@@ -44,6 +44,12 @@ public static class Settings
     public static string SttpSelConfigCsvPath => s_section.SttpSelConfigCsvPath;
 
     /// <summary>
+    /// Gets output path for the cross-reference CSV linking each exported openHistorian measurement
+    /// (point tag, signal ID, signal reference) to its SEL measurement point and quantity. Blank disables it.
+    /// </summary>
+    public static string SignalCrossReferenceCsvPath => s_section.SignalCrossReferenceCsvPath;
+
+    /// <summary>
     /// Gets output path for the power system model stations CSV.
     /// </summary>
     public static string StationsCsvPath => s_section.StationsCsvPath;
@@ -122,6 +128,7 @@ public static class Settings
         s_section.HostService = ("openHistorian", "Name of the host service to load configuration from, e.g., 'openPDC', 'openHistorian', or 'SIEGate'");
         s_section.DefaultInstallPath = (@"C:\Program Files\openHistorian\", "Default installation path for the host service");
         s_section.SttpSelConfigCsvPath = ("sel-sttpreader-signalmappings.csv", "STTP SEL configuration CSV output path");
+        s_section.SignalCrossReferenceCsvPath = ("openhistorian-sel-signal-crossref.csv", "Cross-reference CSV output path linking each exported openHistorian measurement (PointTag, SignalID, SignalReference) to its SEL MeasurementPoint and Quantity; not imported into SynchroWave, leave blank to disable");
         s_section.StationsCsvPath = ("sel-powersystemmodel_stations.csv", "Power system model stations CSV output path");
         s_section.BusesCsvPath = ("sel-powersystemmodel_buses.csv", "Power system model buses CSV output path");
         s_section.LinesCsvPath = ("sel-powersystemmodel_lines.csv", "Power system model lines CSV output path");

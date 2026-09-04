@@ -17,6 +17,7 @@ The exporter connects to an existing GPA application database (e.g., openHistori
 - **Automatic Database Discovery** - Reads configuration from installed GPA service registry keys
 - **STTP Signal Mapping** - Generates `MeasurementPoint` identifiers compatible with SEL SynchroWave Operations using intelligent character reduction and naming convention parsing to meet the 16-character limit
 - **Power System Topology** - Extracts station locations, bus voltages, and transmission line connections
+- **Signal Cross-Reference** - Writes a companion CSV linking each exported openHistorian measurement (point tag, signal ID, signal reference) to its SEL signal, since the SEL mapping file identifies a measurement only by device acronym and description
 - **Frequency Mapping** - Maps each device's frequency and dF/dt signals to the device's bus-voltage measurement point (where frequency is derived), deterministically, since SynchroWave allows each source signal to appear only once in the mapping file
 - **Dash Menu Generation** - Creates hierarchical visualization folder structures, then appends user-maintained custom menu entries so they survive every re-export
 - **Naming Convention Parsing** - Extracts station names, line names, and voltage levels from device-centic metadata
@@ -121,6 +122,7 @@ Export Complete!
 
 Output Files:
   SEL Signal Mappings: sel-sttpreader-signalmappings.csv
+  Signal Cross-Reference (openHistorian point tag to SEL signal, not for import): openhistorian-sel-signal-crossref.csv
   Stations: sel-powersystemmodel_stations.csv
   Buses: sel-powersystemmodel_buses.csv
   Lines: sel-powersystemmodel_lines.csv
@@ -138,6 +140,7 @@ Configuration settings are stored in `defaults.ini` / `settings.ini` in the appl
 | `HostService` | `openHistorian` | Name of the GPA host service to load configuration from (e.g., `openPDC`, `openHistorian`, `SIEGate`) |
 | `DefaultInstallPath` | `C:\Program Files\openHistorian\` | Default installation path if registry lookup fails |
 | `SttpSelConfigCsvPath` | `sel-sttpreader-signalmappings.csv` | Output path for STTP signal mappings CSV |
+| `SignalCrossReferenceCsvPath` | `openhistorian-sel-signal-crossref.csv` | Output path for the cross-reference CSV linking each exported openHistorian measurement (`PointTag`, `SignalID`, `SignalReference`) to its SEL `MeasurementPoint` and `Quantity`; not imported into SynchroWave, blank disables it |
 | `StationsCsvPath` | `sel-powersystemmodel_stations.csv` | Output path for stations CSV |
 | `BusesCsvPath` | `sel-powersystemmodel_buses.csv` | Output path for buses CSV |
 | `LinesCsvPath` | `sel-powersystemmodel_lines.csv` | Output path for lines CSV |
@@ -185,6 +188,9 @@ PersistAlternateTags=[bool]:False
 
 ; Power system model stations CSV output path
 StationsCsvPath=sel-powersystemmodel_stations.csv
+
+; Cross-reference CSV output path linking each exported openHistorian measurement (PointTag, SignalID, SignalReference) to its SEL MeasurementPoint and Quantity; not imported into SynchroWave, leave blank to disable
+SignalCrossReferenceCsvPath=openhistorian-sel-signal-crossref.csv
 
 ; STTP SEL configuration CSV output path
 SttpSelConfigCsvPath=sel-sttpreader-signalmappings.csv

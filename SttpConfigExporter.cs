@@ -76,6 +76,12 @@ public static class SttpConfigExporter
         // 5) Write output CSV
         WriteSelCSV(Settings.SttpSelConfigCsvPath, configRows);
 
+        // 6) Write the companion cross-reference CSV linking each openHistorian measurement (point tag,
+        //    signal ID, signal reference) to its SEL signal - the SEL file itself only identifies a
+        //    measurement by device acronym and description
+        if (!string.IsNullOrWhiteSpace(Settings.SignalCrossReferenceCsvPath))
+            WriteCrossReferenceCSV(Settings.SignalCrossReferenceCsvPath, configRows);
+
         // Return the mappings (including the clean phasor label and signal id) so the power system
         // model exporter can associate measurement points without re-reading and reparsing the CSV.
         ConfigExportResult result = new(
@@ -213,7 +219,9 @@ public static class SttpConfigExporter
                 MeasurementPoint: assignedMP,
                 Quantity: quantity,
                 SignalID: row.SignalID,
-                PhasorLabel: row.PhasorLabel ?? string.Empty
+                PhasorLabel: row.PhasorLabel ?? string.Empty,
+                PointTag: row.PointTag,
+                SignalReference: row.SignalReference ?? string.Empty
             ));
         }
 
@@ -279,7 +287,9 @@ public static class SttpConfigExporter
                             MeasurementPoint: measurementPoint,
                             Quantity: quantity,
                             SignalID: row.SignalID,
-                            PhasorLabel: row.PhasorLabel ?? string.Empty
+                            PhasorLabel: row.PhasorLabel ?? string.Empty,
+                            PointTag: row.PointTag,
+                            SignalReference: row.SignalReference ?? string.Empty
                         ));
                     }
 
@@ -348,7 +358,9 @@ public static class SttpConfigExporter
                 MeasurementPoint: assignedMP,
                 Quantity: quantity,
                 SignalID: row.SignalID,
-                PhasorLabel: row.PhasorLabel ?? string.Empty
+                PhasorLabel: row.PhasorLabel ?? string.Empty,
+                PointTag: row.PointTag,
+                SignalReference: row.SignalReference ?? string.Empty
             ));
         }
 
@@ -782,6 +794,7 @@ public static class SttpConfigExporter
     /// <param name="Phase">Phase identifier (A, B, C, +, -, 0, 1, 2).</param>
     /// <param name="PhasorType">Type of phasor (V for voltage, I for current).</param>
     /// <param name="PhasorLabel">Label identifying the phasor or line name.</param>
+    /// <param name="SignalReference">Signal reference (device acronym plus signal kind and index).</param>
     private sealed record MeasurementRow(
         string SignalID,
         string PointTag,
@@ -792,7 +805,8 @@ public static class SttpConfigExporter
         string? EngineeringUnits,
         string? Phase,
         string? PhasorType,
-        string? PhasorLabel);
+        string? PhasorLabel,
+        string? SignalReference);
 
     /// <summary>
     /// A mapping of one STTP signal to its SEL measurement point and quantity. The first four
@@ -806,13 +820,17 @@ public static class SttpConfigExporter
     /// <param name="Quantity">SEL quantity descriptor (e.g., PhaseA.Voltage.Magnitude, Frequency).</param>
     /// <param name="SignalID">Unique signal identifier from the database.</param>
     /// <param name="PhasorLabel">Clean phasor label from the database (line/bus name); empty for non-phasor signals.</param>
+    /// <param name="PointTag">Full point tag of the source measurement (written to the cross-reference CSV only).</param>
+    /// <param name="SignalReference">Signal reference of the source measurement (written to the cross-reference CSV only).</param>
     public sealed record SignalMapping(
         string DeviceAcronym,
         string Description,
         string MeasurementPoint,
         string Quantity,
         string SignalID,
-        string PhasorLabel);
+        string PhasorLabel,
+        string PointTag,
+        string SignalReference);
 
     /// <summary>
     /// Represents a planned update to the AlternateTag field in the database.
@@ -870,7 +888,8 @@ public static class SttpConfigExporter
                EngineeringUnits,
                Phase,
                PhasorType,
-               PhasorLabel
+               PhasorLabel,
+               SignalReference
             FROM ActiveMeasurement
             """;
 
@@ -894,6 +913,7 @@ public static class SttpConfigExporter
             string? phase = reader["Phase"] is DBNull ? null : Convert.ToString(reader["Phase"], CultureInfo.InvariantCulture);
             string? phasorType = reader["PhasorType"] is DBNull ? null : Convert.ToString(reader["PhasorType"], CultureInfo.InvariantCulture);
             string? phasorLabel = reader["PhasorLabel"] is DBNull ? null : Convert.ToString(reader["PhasorLabel"], CultureInfo.InvariantCulture);
+            string? signalReference = reader["SignalReference"] is DBNull ? null : Convert.ToString(reader["SignalReference"], CultureInfo.InvariantCulture);
 
             rows.Add(new MeasurementRow(
                 SignalID: signalID,
@@ -905,7 +925,8 @@ public static class SttpConfigExporter
                 EngineeringUnits: string.IsNullOrWhiteSpace(engineeringUnits) ? null : engineeringUnits.Trim(),
                 Phase: string.IsNullOrWhiteSpace(phase) ? null : phase.Trim(),
                 PhasorType: string.IsNullOrWhiteSpace(phasorType) ? null : phasorType.Trim(),
-                PhasorLabel: string.IsNullOrWhiteSpace(phasorLabel) ? null : phasorLabel.Trim()
+                PhasorLabel: string.IsNullOrWhiteSpace(phasorLabel) ? null : phasorLabel.Trim(),
+                SignalReference: string.IsNullOrWhiteSpace(signalReference) ? null : signalReference.Trim()
             ));
         }
 
@@ -1538,6 +1559,39 @@ public static class SttpConfigExporter
                 CSVField(row.Description),
                 CSVField(row.MeasurementPoint),
                 CSVField(row.Quantity)
+            ));
+        }
+    }
+
+    /// <summary>
+    /// Writes the companion cross-reference CSV that links each exported openHistorian measurement
+    /// (point tag, signal ID, signal reference) to its SEL signal (measurement point and quantity).
+    /// </summary>
+    /// <param name="path">The file path where the cross-reference CSV will be written.</param>
+    /// <param name="rows">The exported signal mappings.</param>
+    /// <remarks>
+    /// The SEL signal mapping file identifies a source measurement only by device acronym and
+    /// description, so this file is the direct link back to the openHistorian measurement. It is
+    /// not imported into SynchroWave. Rows are ordered by point tag.
+    /// </remarks>
+    private static void WriteCrossReferenceCSV(string path, List<SignalMapping> rows)
+    {
+        using FileStream stream = File.Create(path);
+        using StreamWriter writer = new(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+
+        writer.WriteLine("PointTag,SignalID,SignalReference,DeviceAcronym,Description,MeasurementPoint,Quantity,SELSignal");
+
+        foreach (SignalMapping row in rows.OrderBy(row => row.PointTag, StringComparer.OrdinalIgnoreCase))
+        {
+            writer.WriteLine(string.Join(",",
+                CSVField(row.PointTag),
+                CSVField(row.SignalID),
+                CSVField(row.SignalReference),
+                CSVField(row.DeviceAcronym),
+                CSVField(row.Description),
+                CSVField(row.MeasurementPoint),
+                CSVField(row.Quantity),
+                CSVField($"{row.MeasurementPoint}.{row.Quantity}")
             ));
         }
     }

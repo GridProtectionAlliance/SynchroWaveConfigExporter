@@ -78,6 +78,14 @@ voltage + current, magnitude + angle, frequency, power, availability. In the exp
 ignored. This is the STTP Reader's job: map each incoming `DeviceAcronym`/`Description`
 (auto-filled from the STTP stream's Station+Tag) to an `MP` + `Quantity`.
 
+### Tracing an SEL signal back to its source measurement
+The SEL mapping file names a source measurement only by `DeviceAcronym` + `Description` (the
+stream's Station + Tag) — it never carries the point tag or signal ID. The exporter therefore also
+writes a companion cross-reference CSV (`SignalCrossReferenceCsvPath`; not imported into
+SynchroWave) with `PointTag, SignalID, SignalReference, DeviceAcronym, Description,
+MeasurementPoint, Quantity, SELSignal` per exported row, so an operator can go from an
+openHistorian point tag to the SEL signal name (`MP.Quantity`) and back.
+
 ### Frequency is a device-level signal
 A device measures one frequency (and one dF/dt), but a multi-terminal device (a DFR with
 many phasor labels) yields one MP per terminal. **SynchroWave allows each source signal to

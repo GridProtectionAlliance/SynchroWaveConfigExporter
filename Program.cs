@@ -356,6 +356,9 @@ internal class Program
             Console.WriteLine();
             Console.WriteLine("Output Files:");
             Console.WriteLine($"  SEL Signal Mappings: {Settings.SttpSelConfigCsvPath}");
+
+            if (!string.IsNullOrWhiteSpace(Settings.SignalCrossReferenceCsvPath))
+                Console.WriteLine($"  Signal Cross-Reference (openHistorian point tag to SEL signal, not for import): {Settings.SignalCrossReferenceCsvPath}");
             Console.WriteLine($"  Stations: {modelResult.StationsPath}");
             Console.WriteLine($"  Buses: {modelResult.BusesPath}");
             Console.WriteLine($"  Lines: {modelResult.LinesPath}");
